@@ -8,6 +8,7 @@
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { ToolCallId, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { createScope } from '@deepseek-ai/dsh-scope'
+import { recordCompaction, resolveKeptIndex } from './compaction.js'
 import { PiInbox } from './inbox.js'
 
 const CONTENT_BLOCK_KIND = {
@@ -139,7 +140,7 @@ function allowUi(method, request) {
 }
 
 export class PiAgent {
-  constructor({ ctx, session, agentOptions, rpc, cwd, logger, modelMap, modelInfo, startSource, requestHeader, toolSchemas, streamPaceMs, streamCatchUpFrames, streamMaxCharsPerFrame, extensionUi, toolProgress, approvalTimeoutMs }) {
+  constructor({ ctx, session, agentOptions, rpc, cwd, logger, modelMap, modelInfo, startSource, requestHeader, toolSchemas, streamPaceMs, streamCatchUpFrames, streamMaxCharsPerFrame, extensionUi, toolProgress, approvalTimeoutMs, headerModels }) {
     this.id = session.id
     this.session = session
     this.options = agentOptions ?? {}
@@ -156,6 +157,9 @@ export class PiAgent {
     this.extensionUi = extensionUi === 'allow' || extensionUi === 'approval' ? extensionUi : 'deny'
     // A pending human decision must not pin a turn forever.
     this.approvalTimeoutMs = Number.isFinite(approvalTimeoutMs) && approvalTimeoutMs > 0 ? approvalTimeoutMs : 300000
+    // Metering (and cost panels) key on the model name in `request/header`.
+    // pi's ids need not match the deployment's pricing table.
+    this.headerModels = headerModels
     this.toolProgressEnabled = toolProgress === true
     this.toolProgress = new Map()
     this.thinkingLevel = undefined
@@ -172,6 +176,10 @@ export class PiAgent {
     this.turn = ctx.agents?.turnBoundaryOf(session).lastTurn ?? 0
     this.step = 0
     this.stepOpen = false
+    // `turn/start` is open until `turn/end`; compaction markers must nest in it.
+    this.turnOpen = false
+    this.compactionPending = undefined
+    this.lastCompaction = undefined
     this.aborted = false
     this.cancelCause = { kind: 'user' }
     this.attempt = null
@@ -282,6 +290,7 @@ export class PiAgent {
     const turn = this.turn
 
     this.session.append('turn/start', { turn })
+    this.turnOpen = true
     this.session.append('user/message', message, { surfaceOp: 'append' })
 
     let failure
@@ -304,6 +313,7 @@ export class PiAgent {
         : failure === undefined
           ? { kind: 'completed' }
           : { kind: 'error', error: { message: String(failure), code: 'UNKNOWN' } }
+      this.turnOpen = false
       this.session.append('turn/end', { turn, reason })
     }
   }
@@ -348,7 +358,7 @@ export class PiAgent {
 
     const config = {
       provider: selection.provider,
-      model: selection.model,
+      model: this.headerModels?.[selection.model] ?? selection.model,
       ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
     }
     // Declaring the registry's tools keeps a later native-loop resume
@@ -413,6 +423,13 @@ export class PiAgent {
         return
       case 'tool_execution_end':
         this.#onToolEnd(event)
+        return
+      case 'compaction_start':
+        this.logger?.(`[pi] compaction start (${String(event.reason)})`)
+        this.compactionPending = { reason: event.reason }
+        return
+      case 'compaction_end':
+        void this.#finishCompaction(event)
         return
       case 'thinking_level_changed':
         // Only extension- or UI-driven changes emit this; an RPC
@@ -794,6 +811,68 @@ export class PiAgent {
     } catch (error) {
       this.logger?.(`[pi:ui] respond failed: ${String(error)}`)
     }
+  }
+
+  /**
+   * Ask pi to compact now (the `/compact` command). Recording happens in the
+   * `compaction_end` handler so automatic and manual compaction share one path.
+   */
+  async compactNow(signal) {
+    if (this._status === 'running') return { ok: false, reason: 'busy' }
+    this.lastCompaction = undefined
+    const response = await this.rpc.send({ type: 'compact' })
+    if (response.success !== true) return { ok: false, reason: String(response.error ?? 'pi compact failed') }
+    const deadline = Date.now() + 30000
+    while (this.lastCompaction === undefined && Date.now() < deadline && signal?.aborted !== true) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    return this.lastCompaction ?? { ok: false, reason: 'compaction did not settle' }
+  }
+
+  /**
+   * Mirror pi's compaction into the DSH log.
+   *
+   * pi names the first entry it kept; that has to be translated into "how many
+   * leading messages are gone" before anything can be recorded, because the two
+   * logs number their entries differently.
+   */
+  async #finishCompaction(event) {
+    const pending = this.compactionPending
+    this.compactionPending = undefined
+    if (event.aborted === true) {
+      this.logger?.('[pi] compaction aborted')
+      this.lastCompaction = { ok: false, reason: 'aborted' }
+      return
+    }
+    if (event.result === undefined) {
+      const reason = typeof event.errorMessage === 'string' ? event.errorMessage : 'pi compaction failed'
+      this.logger?.(`[pi] compaction failed: ${reason}`)
+      this.lastCompaction = { ok: false, reason }
+      return
+    }
+    let keptIndex
+    try {
+      keptIndex = await resolveKeptIndex(this.rpc, event.result.firstKeptEntryId)
+    } catch (error) {
+      this.logger?.(`[compaction] could not read pi entries: ${String(error)}`)
+    }
+    // The turn may have closed while `get_entries` was in flight, and a numbered
+    // compaction owner must sit inside an open turn.
+    const selection = this.model.current()
+    const recorded = recordCompaction({
+      session: this.session,
+      keptIndex,
+      result: event.result,
+      turn: this.turnOpen ? this.turn : null,
+      ...(selection === undefined ? {} : { provider: selection.provider, model: selection.model }),
+      logger: this.logger,
+    })
+    if (recorded === undefined) {
+      this.logger?.("[compaction] pi's boundary does not map onto the DSH surface; recorded nothing")
+      this.lastCompaction = { ok: false, reason: 'unmapped' }
+      return
+    }
+    this.lastCompaction = { ok: true, ...recorded, reason: pending?.reason }
   }
 
   /** Push a selected route to pi, honouring the configured route mapping. */

@@ -802,3 +802,85 @@ pi 侧同样 fail closed：`ctx.ui.confirm()` 返回 `undefined`（超时/取消
 1. **`read` 类工具没有拦**（默认列表只有 `bash`/`write`/`edit`）。读操作一般不需要审批，需要时把 `guard` 写成数组即可。
 2. **`mcp__dsh__*` 工具不需要这条链路**：它们本来就经 `ctx.tools.execute`，DSH 的策略在那一侧生效。
 3. **pi 的 `bash` 仍然不是 DSH 的 bash**：审批能拦住它，但沙箱模式、后台 job、spill、终端卡片这些仍是 pi 自己的语义。要统一就得关掉 pi 的 bash、只留桥过来的 DSH bash（见 §13.6 第 1 条）。
+
+---
+
+## 15. 压缩记账与 `/compact`（2026-11-20）
+
+修完 §14 后剩下的最大可观测缺口：pi 自己压缩时，DSH 里 token 数突然掉、历史像丢了，而且**下次 resume 会把 pi 丢掉的历史原样搬回去**——压缩等于被撤销。
+
+### 15.1 DSH 的压缩协议
+
+`dsh-compaction` 的 `types.d.ts` 定义了四段式，实际替换由紧随其后的 surface 事件完成：
+
+```
+compaction/start   { compactionId, turn }
+compaction/summary { summary, shadowedRange, shadowedSeqs, shadowedTokenCount, provider, model, usage? }
+user/message       surfaceOp: replace over shadowedRange   ← 真正执行替换
+compaction/end     { compactionId, turn }
+```
+
+`compaction/summary` 与替换事件必须相邻（"that adjacency is contractual"）。
+
+### 15.2 最难的一步：把 pi 的边界翻译成 DSH 的节点
+
+pi 只给 `firstKeptEntryId`。这个 id 是 **pi 自己的**：pi 每轮都往自己的 session 文件追加条目，只有本插件重建过的历史才用 `e<hex seq>` 形式。所以按 id 前缀解析在实际会话里几乎必然失败。
+
+改用**索引映射**：调 pi 的 `get_entries` 拿 `{ entries, leafId }`，从 `leafId` 沿 `parentId` 回溯出活动分支，按 `type === 'message'` 计数，找到 `firstKeptEntryId` 的下标 `keptIndex`。DSH 的 `session.surface.nodes` 与 pi 的消息列表一比一同序，于是：
+
+```
+shadowedSeqs = surface.nodes.slice(0, keptIndex)
+```
+
+替换事件需要 `sourceEventSeqs` 覆盖所有被遮蔽的节点，否则 `dsh-session` 会直接抛 `surface replace: sourceEventSeqs must include every shadowed surface node`（第一版就是这么撞墙的）。
+
+映射失败时**什么都不写**（不猜、不伪造），只记日志；`/compact` 会返回明确错误。
+
+### 15.3 `/compact`
+
+bundle 禁用了 `command-compact`，所以由本插件接管：
+
+```js
+ctx.inject(['commands'], (commandCtx) => {
+  const unregister = commandCtx.commands.register({ name: 'compact', handler })
+  commandCtx.effect(() => () => unregister())
+})
+```
+
+两个坑：
+
+1. **注册必须发生在 `inject` 回调里直接执行**。把 `register` 放进 `ctx.effect(() => () => register(...))` 的返回值里，cordis 只登记了 disposer，命令从未注册（实测 `commands.list(agent)` 为空）。
+2. **手动与自动压缩共用一条记录路径**：记录只发生在 `compaction_end` 事件里，`compactNow()` 只负责发 `{type:'compact'}` 然后等结果。
+
+### 15.4 resume 必须尊重压缩
+
+`buildPiSessionFile` 现在先算 `shadowedSeqSet(events)`（所有 `compaction/summary.shadowedSeqs` 的并集）并跳过它们。否则 resume 会把 pi 已忘掉的历史重新灌回去，压缩白做。
+
+### 15.5 实测
+
+`scripts/compaction-e2e.mjs`（pi 的 `keepRecentTokens` 默认 20000，测试用项目级 `.pi/settings.json` + `-a` 调到 120，否则 pi 直接拒绝："Nothing to compact (session too small)"）：
+
+| 断言 | 结果 |
+|---|---|
+| `/compact` 已注册 | ✅ |
+| `/compact` 返回 `success`，带 `sourceEventSeq` | ✅ `Compacted 3 history items (~272 tokens).` |
+| `compaction/start` / `summary` / `end` 各一条且 id 配对 | ✅ |
+| `shadowedRange` 与 `shadowedSeqs` 首尾一致 | ✅ |
+| surface 从 6 → 4（3 遮蔽 + 1 摘要） | ✅ |
+| 重建出的 pi 会话条目数 == 压缩后的 surface | ✅ |
+| resume 后压缩记录仍在、surface 不变 | ✅ |
+
+### 15.6 成本面板：名字要对上
+
+`@local/cost-panel6`（用户本地插件）自己按 `request/header` 里的模型名查单价表，键是 `deepseek-v4-flash` / `deepseek-v4-pro`。pi 的模型 id 是 `deepseek-flash`，**对不上 → 费用显示 0**。
+
+所以加了一个只影响记账的映射：
+
+```yaml
+- id: pi-agent
+  config:
+    headerModels:
+      deepseek-flash: deepseek-v4-flash
+```
+
+它只改写 `request/header` 的 `model`，不影响发给 pi 的路由。代价：`request/header` 是原生 loop 续接时解析模型的依据，别名必须也是该部署里注册过的模型，否则切回原生 loop 那一侧会解析失败。

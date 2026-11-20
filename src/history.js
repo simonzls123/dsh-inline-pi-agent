@@ -12,6 +12,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
+import { shadowedSeqSet } from './compaction.js'
+
 function textBlocks(blocks) {
   return blocks.filter((block) => block && block.type === 'text').map((block) => block.text)
 }
@@ -123,7 +125,13 @@ export function buildPiSessionFile({ session, cwd, filePath, logger }) {
   const entries = []
   let parentId = null
 
-  for (const event of session.snapshotEvents()) {
+  const events = session.snapshotEvents()
+  // Everything a compaction already dropped stays out: replaying it would
+  // resurrect exactly the history pi chose to forget.
+  const shadowed = shadowedSeqSet(events)
+
+  for (const event of events) {
+    if (shadowed.has(event.seq)) continue
     let message
     switch (event.type) {
       case 'turn/end':

@@ -124,6 +124,7 @@ export class PiAgentFactory {
       ...(this.options.extensionUi === undefined ? {} : { extensionUi: this.options.extensionUi }),
       ...(this.options.toolProgress === undefined ? {} : { toolProgress: this.options.toolProgress }),
       ...(this.options.approvalTimeoutMs === undefined ? {} : { approvalTimeoutMs: this.options.approvalTimeoutMs }),
+      ...(this.options.headerModels === undefined ? {} : { headerModels: this.options.headerModels }),
     })
     // Tool calls can only arrive after a prompt, so filling the box here is
     // always earlier than the bridge needs it.

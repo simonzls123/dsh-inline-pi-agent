@@ -105,6 +105,7 @@ export async function apply(ctx, config = {}) {
     ...(config.extensionUi === undefined ? {} : { extensionUi: config.extensionUi }),
     ...(config.toolProgress === undefined ? {} : { toolProgress: config.toolProgress }),
     ...(positive(config.approvalTimeoutMs) ? { approvalTimeoutMs: config.approvalTimeoutMs } : {}),
+    ...(config.headerModels === undefined ? {} : { headerModels: config.headerModels }),
     ...(Array.isArray(config.piArgs) ? { piArgs: config.piArgs.filter((arg) => typeof arg === 'string') } : {}),
     ...(bridge === undefined ? {} : { bridge }),
     ...(bridgeExtension === undefined ? {} : { bridgeExtension }),
@@ -115,6 +116,43 @@ export async function apply(ctx, config = {}) {
     logger,
   })
   ctx.agents.setFactory(factory)
+
+  // `/compact` belongs to whichever engine owns compaction: `command-compact`
+  // is disabled by this bundle, so pi's own `compact` RPC backs the command.
+  ctx.inject(['commands'], (commandCtx) => {
+    const unregister = commandCtx.commands.register({
+        name: 'compact',
+        description: 'Compact older conversation history (via pi)',
+        async handler(invocation) {
+          if (invocation.rawInput.trim() !== '') {
+            return { kind: 'error', text: 'Usage: /compact' }
+          }
+          const agent = invocation.agent
+          if (typeof agent?.compactNow !== 'function') {
+            return { kind: 'error', text: 'This session is not driven by pi.' }
+          }
+          const outcome = await agent.compactNow(invocation.signal)
+          if (invocation.signal.aborted) return { kind: 'error', text: 'Compaction cancelled.' }
+          if (outcome.ok !== true) {
+            if (outcome.reason === 'busy') return { kind: 'error', text: 'Compaction is unavailable while the session is running.' }
+            if (outcome.reason === 'unmapped') {
+              return {
+                kind: 'error',
+                text: "pi compacted its own context, but its boundary could not be mapped onto this session's history. Use `/compact` after the next turn.",
+              }
+            }
+            return { kind: 'error', text: `Compaction failed: ${String(outcome.reason)}` }
+          }
+          return {
+            kind: 'success',
+            text: `Compacted ${String(outcome.shadowedCount)} history items (~${String(outcome.shadowedTokenCount)} tokens).`,
+            ...(outcome.summarySeq === undefined ? {} : { sourceEventSeq: outcome.summarySeq }),
+          }
+        },
+    })
+    // `effect` installs the disposer; the registration itself must happen now.
+    commandCtx.effect(() => () => unregister())
+  })
 
   // A live bundle toggle unloads this plugin while agents may still be running:
   // tear them down (and close their pi children) instead of leaking them.

@@ -46,6 +46,7 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `extensionUi` | `deny` | pi 扩展发起阻塞式对话框时如何应答：`deny` 一律 `cancelled`；`approval` 把 `confirm` 转成 DSH 的审批请求（会话策略决定是否弹窗）；`allow` 按“确认/首项/空串”放行（仅调试）。 |
 | `guard` | 关 | 用 pi 的 `tool_call` 钩子把 pi **自己**的工具拦到审批前面。`true` = `[bash, write, edit]`，也可给数组。需要 `extensionUi: 'approval'`。 |
 | `approvalTimeoutMs` | `300000` | 单次审批等待上限；超时按拒绝处理（fail closed）。 |
+| `headerModels` | 空 | 只改写 `request/header` 里的模型名（作用于计量与成本面板），不影响发给 pi 的路由。例如 `{deepseek-flash: deepseek-v4-flash}`。 |
 | `toolProgress` | `false` | 把 pi 的工具中间输出（`tool_execution_update`）作为 `agent/tool-progress` 实时通知发布。会话日志不受影响；当前 Web 客户端还不渲染该通知。 |
 | `debug` | `false` | 协议与生命周期日志。 |
 
@@ -113,6 +114,7 @@ pi 执行自己的工具，DSH 的审批策略原本看不到它们。开启下�
 ## 已知限制
 
 - **pi 自己的工具**只有配了 `guard` 才受 DSH 审批约束；未配置时（默认）它们仍由 pi 直接执行。
+- 压缩（自动与 `/compact`）会被记成 DSH 的 `compaction/*` 事务并替换 surface；pi 的边界无法映射到 DSH 节点时**不记录**（避免伪造 surface），`/compact` 会返回错误。
 - 插件不派发 `agent/pre-step`，依赖它的钩子（时间注入、每步 flush、plan-mode 旁白）在 pi 会话中不生效。
 - `contextBreakdown.toolsTokens` 描述的是 DSH 工具注册表而非 pi 的工具块（写在 `request/header` 上是为了让原生 loop 能续接）；上下文压力本身来自 provider 上报的 usage。
 - 模型目录探测（`probeModels`）会额外起一个 pi 子进程，因此**不再阻塞插件加载**：会话先可用，目录适配器稍后补注册。首次打开模型选择器若扑空，等几秒再打开。

@@ -46,6 +46,7 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `extensionUi` | `deny` | How blocking extension dialogs are answered: `deny` replies `cancelled`; `approval` routes `confirm` through DSH's approval seam; `allow` approves the first option (debugging only). |
 | `guard` | off | Gate pi's **own** tools behind DSH approval via pi's `tool_call` hook. `true` means `[bash, write, edit]`; an array picks tools. Requires `extensionUi: 'approval'`. |
 | `approvalTimeoutMs` | `300000` | Upper bound for one approval; a timeout counts as a rejection (fail closed). |
+| `headerModels` | none | Rewrites the model name recorded on `request/header` (metering and cost panels) without changing the route sent to pi, e.g. `{deepseek-flash: deepseek-v4-flash}`. |
 | `toolProgress` | `false` | Publish pi's partial tool output (`tool_execution_update`) as live `agent/tool-progress` notifications. The session log is untouched; the current Web client does not render them yet. |
 | `debug` | `false` | Protocol and lifecycle diagnostics. |
 

@@ -2,7 +2,7 @@
  * End to end: pi calls a DSH tool through the MCP bridge.
  * Boots the minimum services, mounts an executor, registers one tool.
  */
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
@@ -19,6 +19,8 @@ import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import * as piAgentPlugin from '../src/index.js'
 
 const workdir = join(process.cwd(), '.tmp-bridge-e2e')
+// Fresh every run: a leftover log would collide on the same session id.
+rmSync(workdir, { recursive: true, force: true })
 mkdirSync(workdir, { recursive: true })
 const sessionRoot = join(workdir, 'sessions')
 mkdirSync(sessionRoot, { recursive: true })
