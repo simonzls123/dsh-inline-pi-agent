@@ -37,6 +37,7 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `models` | 空 | 两套目录命名不一致时的 DSH 路由 → pi 路由映射。 |
 | `catalog` | `true` | 是否把 pi 的模型目录注册进 DSH（选择器据此显示）。 |
 | `requestHeader` | `true` | 每步记录 `request/header` 与 `request/context`；token 计量与会话交还依赖它。 |
+| `presentFiles` | `true` | 成功 write/edit 后追加 `deliverables/presented`，让 DSH 在轮次末尾显示文件卡片。 |
 | `streamPaceMs` | `16` | 文本揭示节拍（8–200ms）。pi 的 delta 是突发到达的，每拍最多揭示一帧缓冲文本。 |
 | `streamCatchUpFrames` | `6` | 完整积压应在多少拍内排空，用来决定追赶速率。 |
 | `streamMaxCharsPerFrame` | `64` | 单帧最多揭示的字符数。 |

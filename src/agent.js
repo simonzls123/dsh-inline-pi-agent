@@ -199,7 +199,7 @@ function allowUi(method, request) {
 }
 
 export class PiAgent {
-  constructor({ ctx, session, agentOptions, rpc, cwd, logger, modelMap, modelInfo, startSource, requestHeader, toolSchemas, streamPaceMs, streamCatchUpFrames, streamMaxCharsPerFrame, extensionUi, toolProgress, approvalTimeoutMs, headerModels }) {
+  constructor({ ctx, session, agentOptions, rpc, cwd, logger, modelMap, modelInfo, startSource, requestHeader, presentFiles, toolSchemas, streamPaceMs, streamCatchUpFrames, streamMaxCharsPerFrame, extensionUi, toolProgress, approvalTimeoutMs, headerModels }) {
     this.id = session.id
     this.session = session
     this.options = agentOptions ?? {}
@@ -220,6 +220,7 @@ export class PiAgent {
     // pi's ids need not match the deployment's pricing table.
     this.headerModels = headerModels
     this.toolProgressEnabled = toolProgress === true
+    this.presentFilesEnabled = presentFiles !== false
     this.toolProgress = new Map()
     this.thinkingLevel = undefined
 
@@ -773,6 +774,14 @@ export class PiAgent {
       { turn: this.turn, step: this.step, message, ...(meta === undefined ? {} : { meta }) },
       { surfaceOp: 'append', ...(callSeq === undefined ? {} : { sourceEventSeqs: [callSeq] }) },
     )
+    if (this.presentFilesEnabled && this.turnOpen && !event.isError
+      && meta !== undefined && typeof meta.path === 'string') {
+      this.session.append('deliverables/presented', {
+        turn: this.turn,
+        callId,
+        files: [{ path: meta.path }],
+      })
+    }
   }
 
   /**

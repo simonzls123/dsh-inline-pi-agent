@@ -166,6 +166,17 @@ check(
     && writeMeta.diffs.some((diff) => typeof diff.newText === 'string' && diff.newText.includes('hello from pi')),
   JSON.stringify(writeMeta),
 )
+const presented = writeEvents.find((event) => event.type === 'deliverables/presented'
+  && String(event.data.callId ?? '') === String(writeCall?.data?.callId ?? ''))
+check(
+  'write publishes a file delivery',
+  presented !== undefined
+    && typeof presented.data.turn === 'number'
+    && Array.isArray(presented.data.files)
+    && presented.data.files.length === 1
+    && resolve(String(presented.data.files[0]?.path)) === resolve(written),
+  JSON.stringify(presented?.data),
+)
 check(
   'the file was written',
   existsSync(written) && readFileSync(written, 'utf8').includes('hello from pi'),

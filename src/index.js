@@ -101,6 +101,7 @@ export async function apply(ctx, config = {}) {
     ...(config.models === undefined ? {} : { models: config.models }),
     ...(config.piSessionDir === undefined ? {} : { piSessionDir: config.piSessionDir }),
     requestHeader: config.requestHeader !== false,
+    presentFiles: config.presentFiles !== false,
     modelInfo: (provider, model) => catalog.lookup?.(provider, model),
     ...(config.extensionUi === undefined ? {} : { extensionUi: config.extensionUi }),
     ...(config.toolProgress === undefined ? {} : { toolProgress: config.toolProgress }),

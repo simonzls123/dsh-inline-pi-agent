@@ -115,6 +115,7 @@ export class PiAgentFactory {
       logger: this.options.logger,
       startSource: source,
       requestHeader: this.options.requestHeader !== false,
+      ...(this.options.presentFiles === undefined ? {} : { presentFiles: this.options.presentFiles }),
       toolSchemas: () => this.registryCtx.get('tools')?.schemas?.() ?? [],
       ...(this.options.streamPaceMs === undefined ? {} : { streamPaceMs: this.options.streamPaceMs }),
       ...(this.options.streamCatchUpFrames === undefined ? {} : { streamCatchUpFrames: this.options.streamCatchUpFrames }),

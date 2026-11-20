@@ -37,6 +37,7 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `models` | empty | DSH route → pi route mapping, when the two catalogs use different names. |
 | `catalog` | `true` | Register pi's model catalog into DSH so the selector lists pi's models. |
 | `requestHeader` | `true` | Record `request/header` and `request/context` per step. Needed for token measurement and for handing a session back to the built-in loop. |
+| `presentFiles` | `true` | After a successful write/edit, append `deliverables/presented` so DSH renders the file in the turn-tail deliverables card. |
 | `streamPaceMs` | `16` | Reveal cadence for streamed text (8–200 ms). pi delivers deltas in bursts; each tick reveals at most one frame of buffered text. |
 | `streamCatchUpFrames` | `6` | How many ticks a full backlog should take to drain, which sets the reveal rate while text is arriving faster than it is shown. |
 | `streamMaxCharsPerFrame` | `64` | Upper bound on characters revealed by one frame. |
