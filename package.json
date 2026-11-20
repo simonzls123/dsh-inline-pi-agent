@@ -1,6 +1,6 @@
 {
   "name": "dsh-inline-pi-agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Run the pi coding agent loop inside DeepSeek Harness as a profile bundle",
   "type": "module",

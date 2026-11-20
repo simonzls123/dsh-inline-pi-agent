@@ -84,8 +84,44 @@ function sameRun(first, next) {
   return first.kind !== 'tool-call' || (next.id === first.id && next.name === first.name)
 }
 
+/** Extension UI methods that block the agent until the host answers. */
+const DIALOG_METHODS = new Set(['select', 'confirm', 'input', 'editor'])
+
+/** Bounded live preview for one running tool call. */
+const TOOL_PROGRESS_LIMIT = 8192
+
+/** Short, log-safe rendering of a request title. */
+function uiTitle(request) {
+  const title = typeof request.title === 'string' ? request.title : (typeof request.message === 'string' ? request.message : '')
+  return title.length > 120 ? `${title.slice(0, 120)}…` : title
+}
+
+/**
+ * The permissive answer for one dialog method.
+ *
+ * Only used when `extensionUi: 'allow'` is configured: the default is to answer
+ * every dialog with `cancelled`, because DSH cannot yet route a pi extension's
+ * question to a human.
+ */
+function allowUi(method, request) {
+  switch (method) {
+    case 'confirm':
+      return { confirmed: true }
+    case 'select':
+      return Array.isArray(request.options) && request.options.length > 0
+        ? { value: String(request.options[0]) }
+        : { cancelled: true }
+    case 'input':
+      return { value: '' }
+    case 'editor':
+      return { value: typeof request.prefill === 'string' ? request.prefill : '' }
+    default:
+      return { cancelled: true }
+  }
+}
+
 export class PiAgent {
-  constructor({ ctx, session, agentOptions, rpc, cwd, logger, modelMap, modelInfo, startSource, requestHeader, toolSchemas, streamPaceMs, streamCatchUpFrames, streamMaxCharsPerFrame }) {
+  constructor({ ctx, session, agentOptions, rpc, cwd, logger, modelMap, modelInfo, startSource, requestHeader, toolSchemas, streamPaceMs, streamCatchUpFrames, streamMaxCharsPerFrame, extensionUi, toolProgress }) {
     this.id = session.id
     this.session = session
     this.options = agentOptions ?? {}
@@ -97,6 +133,12 @@ export class PiAgent {
     this.toolSchemas = toolSchemas
     this.startSource = startSource ?? 'startup'
     this.requestHeader = requestHeader !== false
+    // `deny` answers every blocking extension dialog with `cancelled`, so an
+    // extension can never hang the run or silently approve its own action.
+    this.extensionUi = extensionUi === 'allow' ? 'allow' : 'deny'
+    this.toolProgressEnabled = toolProgress === true
+    this.toolProgress = new Map()
+    this.thinkingLevel = undefined
 
     this._status = 'idle'
     this.scope = createScope(ctx, this)
@@ -128,6 +170,7 @@ export class PiAgent {
     this.lastContextKey = undefined
 
     this.unwatch = this.rpc.onEvent((event) => this.#onPiEvent(event))
+    this.unwatchUi = this.rpc.onUiRequest((request) => this.#onUiRequest(request))
     this.unwatchExit = this.rpc.onExit((info) => {
       this.rpcExited = info
       const waiters = this.settleWaiters.splice(0)
@@ -345,8 +388,17 @@ export class PiAgent {
       case 'tool_execution_start':
         this.#onToolStart(event)
         return
+      case 'tool_execution_update':
+        this.#onToolProgress(event)
+        return
       case 'tool_execution_end':
         this.#onToolEnd(event)
+        return
+      case 'thinking_level_changed':
+        // Only extension- or UI-driven changes emit this; an RPC
+        // `set_thinking_level` is confirmed by reading `get_state` instead.
+        this.thinkingLevel = typeof event.level === 'string' ? event.level : undefined
+        this.logger?.(`[pi] thinking level now ${String(this.thinkingLevel)}`)
         return
       case 'agent_settled': {
         const waiters = this.settleWaiters.splice(0)
@@ -605,6 +657,7 @@ export class PiAgent {
   #onToolEnd(event) {
     this.#openStep()
     const callId = ToolCallId(String(event.toolCallId ?? ''))
+    this.toolProgress.delete(String(callId))
     const callSeq = this.toolCallSeqs.get(String(callId))
     const text = resultText(event.result)
     const message = createToolResultMessage({
@@ -619,6 +672,59 @@ export class PiAgent {
     )
   }
 
+  /**
+   * Keep a bounded preview of a running tool's output.
+   *
+   * DSH has no durable event for tool progress: its own bash streams through
+   * the job registry instead, and appending partial `tool/result` records would
+   * corrupt both replay and the model's history. So this stays in memory and is
+   * published as a live-only notification when `toolProgress` is enabled. A
+   * client that does not know the notification simply ignores it; the session
+   * log is never touched.
+   */
+  #onToolProgress(event) {
+    const callId = String(event.toolCallId ?? '')
+    if (callId === '') return
+    const text = resultText(event.partialResult)
+    if (text === '') return
+    const preview = text.length > TOOL_PROGRESS_LIMIT ? text.slice(-TOOL_PROGRESS_LIMIT) : text
+    this.toolProgress.set(callId, preview)
+    if (!this.toolProgressEnabled) return
+    try {
+      this.dispatch.emit('agent/tool-progress', {
+        callId: ToolCallId(callId),
+        name: String(event.toolName ?? ''),
+        text: preview,
+      })
+    } catch {
+      // An unknown notification must never break the run.
+    }
+  }
+
+  /**
+   * Answer one extension UI request from the pi child.
+   *
+   * Blocking dialogs (`select`/`confirm`/`input`/`editor`) must always be
+   * answered, otherwise the extension waits for its timeout — and a `confirm`
+   * timeout resolves with the extension's own default, which is usually "yes".
+   * Fire-and-forget methods carry presentation only and are logged.
+   */
+  #onUiRequest(request) {
+    const id = String(request?.id ?? '')
+    const method = String(request?.method ?? '')
+    if (!DIALOG_METHODS.has(method)) {
+      this.logger?.(`[pi:ui] ${method} ${uiTitle(request)}`)
+      return
+    }
+    const answer = this.extensionUi === 'allow' ? allowUi(method, request) : { cancelled: true }
+    this.logger?.(`[pi:ui] ${method} "${uiTitle(request)}" -> ${JSON.stringify(answer)}`)
+    try {
+      this.rpc.respondUi(id, answer)
+    } catch (error) {
+      this.logger?.(`[pi:ui] respond failed: ${String(error)}`)
+    }
+  }
+
   /** Push a selected route to pi, honouring the configured route mapping. */
   #applyModel(selection) {
     const key = `${selection.provider}/${selection.model}`
@@ -631,6 +737,18 @@ export class PiAgent {
     void this.rpc
       .setModel(route.slice(0, separator), route.slice(separator + 1))
       .catch((error) => this.logger?.(`[pi] set_model failed for ${key}: ${String(error)}`))
+    if (typeof selection.reasoningEffort === 'string' && selection.reasoningEffort !== '') {
+      // Levels are model-scoped, so they follow set_model. pi clamps the request
+      // to the model's capabilities (medium may land on high); log the result.
+      void this.rpc
+        .setThinkingLevel(selection.reasoningEffort)
+        .then((applied) => {
+          if (applied !== undefined && applied !== selection.reasoningEffort) {
+            this.logger?.(`[pi] thinking level ${selection.reasoningEffort} clamped to ${applied}`)
+          }
+        })
+        .catch((error) => this.logger?.(`[pi] set_thinking_level failed for ${key}: ${String(error)}`))
+    }
   }
 
   /** Stop the driver and the pi child, then unwind the scoped context. */
@@ -640,7 +758,9 @@ export class PiAgent {
     this.aborted = true
     this.#drainNow()
     this.unwatch?.()
+    this.unwatchUi?.()
     this.unwatchExit?.()
+    this.toolProgress.clear()
     this.rpc.close()
     this.#closeStep()
     await this.scope.dispose()

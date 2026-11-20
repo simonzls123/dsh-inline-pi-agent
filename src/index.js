@@ -45,19 +45,24 @@ export async function apply(ctx, config = {}) {
     : undefined
 
   // Advertise pi's own models so the selector offers what actually runs.
-  // Registered before the factory so a published agent implies a ready catalog.
-  let modelInfo
+  // The probe spawns a whole pi child (seconds on Windows), so it stays off the
+  // startup path: sessions are served without a catalog, and the adapter lands
+  // when the probe answers. Registrations still belong to this plugin's fiber,
+  // so unloading the plugin disposes them with everything else.
+  const catalog = { lookup: undefined }
   if (config.catalog !== false) {
-    try {
-      const models = await probeModels({ piPath: config.piPath ?? 'pi', cwd: config.cwd ?? process.cwd(), logger })
-      const adapter = new PiCatalogAdapter(models)
-      if (adapter.providers.length > 0) {
-        ctx.llm.registerAdapter(adapter.providers, adapter)
-        modelInfo = (provider, model) => adapter.lookup(provider, model)
+    void (async () => {
+      try {
+        const models = await probeModels({ piPath: config.piPath ?? 'pi', cwd: config.cwd ?? process.cwd(), logger })
+        const adapter = new PiCatalogAdapter(models)
+        if (adapter.providers.length > 0) {
+          ctx.llm.registerAdapter(adapter.providers, adapter)
+          catalog.lookup = (provider, model) => adapter.lookup(provider, model)
+        }
+      } catch (error) {
+        ctx.logger?.warn?.(`[pi-agent] model catalog unavailable: ${String(error)}`)
       }
-    } catch (error) {
-      ctx.logger?.warn?.(`[pi-agent] model catalog unavailable: ${String(error)}`)
-    }
+    })()
   }
 
   const factory = new PiAgentFactory(ctx, {
@@ -67,7 +72,10 @@ export async function apply(ctx, config = {}) {
     ...(config.models === undefined ? {} : { models: config.models }),
     ...(config.piSessionDir === undefined ? {} : { piSessionDir: config.piSessionDir }),
     requestHeader: config.requestHeader !== false,
-    ...(modelInfo === undefined ? {} : { modelInfo }),
+    modelInfo: (provider, model) => catalog.lookup?.(provider, model),
+    ...(config.extensionUi === undefined ? {} : { extensionUi: config.extensionUi }),
+    ...(config.toolProgress === undefined ? {} : { toolProgress: config.toolProgress }),
+    ...(Array.isArray(config.piArgs) ? { piArgs: config.piArgs.filter((arg) => typeof arg === 'string') } : {}),
     ...(positive(config.streamPaceMs) ? { streamPaceMs: Math.min(200, Math.max(8, config.streamPaceMs)) } : {}),
     ...(positive(config.streamCatchUpFrames) ? { streamCatchUpFrames: Math.max(1, Math.round(config.streamCatchUpFrames)) } : {}),
     ...(positive(config.streamMaxCharsPerFrame) ? { streamMaxCharsPerFrame: Math.max(1, Math.round(config.streamMaxCharsPerFrame)) } : {}),

@@ -88,6 +88,7 @@ export class PiAgentFactory {
       piPath: this.options.piPath,
       cwd,
       ...(sessionFile === undefined ? {} : { sessionFile }),
+      ...(Array.isArray(this.options.piArgs) ? { extraArgs: this.options.piArgs } : {}),
       logger: this.options.logger,
     })
     const requested = { ...routeOptions(this.options.model), ...agentOptions }
@@ -106,6 +107,8 @@ export class PiAgentFactory {
       ...(this.options.streamMaxCharsPerFrame === undefined ? {} : { streamMaxCharsPerFrame: this.options.streamMaxCharsPerFrame }),
       ...(this.options.models === undefined ? {} : { modelMap: this.options.models }),
       ...(this.options.modelInfo === undefined ? {} : { modelInfo: this.options.modelInfo }),
+      ...(this.options.extensionUi === undefined ? {} : { extensionUi: this.options.extensionUi }),
+      ...(this.options.toolProgress === undefined ? {} : { toolProgress: this.options.toolProgress }),
     })
     // Align pi's route with the route this session already shows: prefer the
     // configured mapping, else try the DSH route verbatim (identical names).
@@ -114,9 +117,16 @@ export class PiAgentFactory {
       : `${requested.provider}/${requested.model}`
     const route = splitRoute(this.options.models?.[requestedRoute] ?? requestedRoute ?? '')
     if (route !== undefined) {
-      void rpc.setModel(route.provider, route.modelId).catch((error) => {
-        this.options.logger?.(`[pi] set_model failed: ${String(error)}`)
-      })
+      const level = requested.reasoningEffort
+      // Serialized: thinking levels are validated against the selected model.
+      void (async () => {
+        try {
+          await rpc.setModel(route.provider, route.modelId)
+          if (typeof level === 'string' && level !== '') await rpc.setThinkingLevel(level)
+        } catch (error) {
+          this.options.logger?.(`[pi] initial route failed: ${String(error)}`)
+        }
+      })()
     }
 
     let detachSession

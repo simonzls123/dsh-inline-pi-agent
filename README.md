@@ -41,6 +41,9 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `streamCatchUpFrames` | `6` | How many ticks a full backlog should take to drain, which sets the reveal rate while text is arriving faster than it is shown. |
 | `streamMaxCharsPerFrame` | `64` | Upper bound on characters revealed by one frame. |
 | `piSessionDir` | `~/.dsh/pi-sessions` | Where rebuilt pi session snapshots are written. |
+| `piArgs` | none | Extra pi child arguments, e.g. `['-e', 'C:/guard/permission.ts']` for an approval gate extension. |
+| `extensionUi` | `deny` | How blocking extension dialogs (`select`/`confirm`/`input`/`editor`) are answered. `deny` always replies `cancelled`; `allow` approves the first option (debugging only). |
+| `toolProgress` | `false` | Publish pi's partial tool output (`tool_execution_update`) as live `agent/tool-progress` notifications. The session log is untouched; the current Web client does not render them yet. |
 | `debug` | `false` | Protocol and lifecycle diagnostics. |
 
 Override any of them in your profile patch:
@@ -53,9 +56,11 @@ Override any of them in your profile patch:
 
 ## Known limitations
 
-- pi executes its own tools, so DSH sandboxing, approval flow and permission presets do not apply to them.
+- pi executes its own tools, so DSH sandboxing, approval flow and permission presets do not apply to them. To actually gate them, load a pi extension that hooks `tool_call` and calls `ctx.ui.confirm()`, then bridge the dialog — the plugin answers it (default `extensionUi: 'deny'`).
 - The plugin does not dispatch `agent/pre-step`. Hooks that rely on it — time-context injection, the per-step flush, plan-mode narration — do not run for pi sessions.
 - `contextBreakdown.toolsTokens` describes DSH's tool registry rather than pi's tool block; it is declared on `request/header` so a native-loop resume stays valid. Context pressure itself comes from provider-reported usage.
+- The model catalog probe (`probeModels`) spawns one extra pi child, so it no longer blocks plugin load: sessions are served immediately and the adapter is registered when the probe answers.
+- **Agent Team (`dsh-agent-team`) is not available.** `subagent` and the task-board tools are DSH model tools, and a pi child never sees DSH's tool registry. See `CONTRACT.md` §12.5.
 
 ## Rollback
 

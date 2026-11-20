@@ -41,6 +41,9 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `streamCatchUpFrames` | `6` | 完整积压应在多少拍内排空，用来决定追赶速率。 |
 | `streamMaxCharsPerFrame` | `64` | 单帧最多揭示的字符数。 |
 | `piSessionDir` | `~/.dsh/pi-sessions` | 重建的 pi 会话快照目录。 |
+| `piArgs` | 空 | 追加给 pi 子进程的参数，如 `['-e', 'C:/guard/permission.ts']`（审批网关扩展）。 |
+| `extensionUi` | `deny` | pi 扩展发起阻塞式对话框（`select`/`confirm`/`input`/`editor`）时如何应答。`deny` 一律回 `cancelled`，`allow` 按“确认/首项/空串”放行（仅调试用）。 |
+| `toolProgress` | `false` | 把 pi 的工具中间输出（`tool_execution_update`）作为 `agent/tool-progress` 实时通知发布。会话日志不受影响；当前 Web 客户端还不渲染该通知。 |
 | `debug` | `false` | 协议与生命周期日志。 |
 
 在自己的 profile patch 里覆盖：
@@ -53,9 +56,11 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 
 ## 已知限制
 
-- pi 自己执行工具，因此 DSH 的沙箱、审批与权限预设不作用于这些工具。
+- pi 自己执行工具，因此 DSH 的沙箱、审批与权限预设不作用于这些工具。要真正拦住 pi 的工具，需要 `piArgs: ['-e', '<guard.ts>']` 加载一个用 `tool_call` 钩子 + `ctx.ui.confirm()` 的 pi 扩展，再由本插件把对话框桥出去（当前 `extensionUi: 'deny'` 会让它一律按“拒绝”处理）。
 - 插件不派发 `agent/pre-step`，依赖它的钩子（时间注入、每步 flush、plan-mode 旁白）在 pi 会话中不生效。
 - `contextBreakdown.toolsTokens` 描述的是 DSH 工具注册表而非 pi 的工具块（写在 `request/header` 上是为了让原生 loop 能续接）；上下文压力本身来自 provider 上报的 usage。
+- 模型目录探测（`probeModels`）会额外起一个 pi 子进程，因此**不再阻塞插件加载**：会话先可用，目录适配器稍后补注册。首次打开模型选择器若扑空，等几秒再打开。
+- Agent Team（`dsh-agent-team`）**当前不可用**：`subagent`/任务板是 DSH 侧注册的模型工具，而 pi 子进程只用自己的工具表，模型看不到它们。详见 `CONTRACT.md` §12。
 
 ## 回退
 

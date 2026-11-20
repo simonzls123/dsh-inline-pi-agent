@@ -10,6 +10,9 @@ import { EventEmitter } from 'node:events'
 
 const isWindows = process.platform === 'win32'
 
+/** Levels pi accepts by name; an unknown one is silently treated as `off`. */
+const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+
 function cmdQuote(value) {
   return /[\s"]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value
 }
@@ -26,7 +29,7 @@ function resolveSpawn(piPath, args) {
 }
 
 export class PiRpcClient {
-  constructor({ piPath = 'pi', cwd, sessionFile, logger }) {
+  constructor({ piPath = 'pi', cwd, sessionFile, logger, extraArgs }) {
     this.cwd = cwd
     this.logger = logger
     this.closed = false
@@ -34,8 +37,14 @@ export class PiRpcClient {
     this.buffer = ''
     this.pending = new Map()
     this.events = new EventEmitter()
+    // Extension UI requests are a separate subprotocol: they carry their own id
+    // namespace and expect `extension_ui_response` on stdin (docs/rpc-extension-ui.md).
+    this.ui = new EventEmitter()
 
     const args = ['--mode', 'rpc']
+    // Caller-supplied flags (e.g. `-e <guard.ts>`) come before the session
+    // selector so a positional session path stays last.
+    if (Array.isArray(extraArgs)) for (const arg of extraArgs) if (typeof arg === 'string') args.push(arg)
     if (sessionFile === undefined) args.push('--no-session')
     else args.push('--session', sessionFile)
     const { file, args: spawnArgs } = resolveSpawn(piPath, args)
@@ -93,7 +102,19 @@ export class PiRpcClient {
       entry.resolve(record)
       return
     }
+    // A dialog request blocks the agent until the client answers. Dropping it
+    // on the floor stalls the run, so it never reaches the event stream.
+    if (record?.type === 'extension_ui_request') {
+      this.ui.emit('request', record)
+      return
+    }
     this.events.emit('event', record)
+  }
+
+  /** Answer one `extension_ui_request`; fire-and-forget, no correlated response. */
+  respondUi(id, body) {
+    if (this.closed) return
+    this.proc.stdin.write(`${JSON.stringify({ type: 'extension_ui_response', id, ...body })}\n`)
   }
 
   /** Send one command and resolve with its correlated response envelope. */
@@ -136,9 +157,33 @@ export class PiRpcClient {
     return response.data
   }
 
+  /**
+   * Set the reasoning level. Levels are model-scoped, so call after setModel.
+   * @returns the level pi actually applied, after clamping to the model.
+   */
+  async setThinkingLevel(level) {
+    // pi answers `success` for an unrecognized level and lands on `off`, which
+    // would silently disable reasoning. Reject locally instead.
+    if (!THINKING_LEVELS.has(level)) throw new Error(`pi has no thinking level "${String(level)}"`)
+    const response = await this.send({ type: 'set_thinking_level', level })
+    if (!response.success) throw new Error(response.error ?? 'pi set_thinking_level failed')
+    try {
+      const state = await this.send({ type: 'get_state' })
+      const applied = state.data?.thinkingLevel
+      return typeof applied === 'string' ? applied : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   onEvent(listener) {
     this.events.on('event', listener)
     return () => this.events.off('event', listener)
+  }
+
+  onUiRequest(listener) {
+    this.ui.on('request', listener)
+    return () => this.ui.off('request', listener)
   }
 
   onExit(listener) {

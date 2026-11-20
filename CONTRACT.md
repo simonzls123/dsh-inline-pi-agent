@@ -593,3 +593,77 @@ dsh plugin --profile web add link:C:/Users/k/Documents/DSH/dsh-pi-agent
 - [x] 在 pi 下跑过几轮再切回原生 loop 的会话可正常续接（header 需声明 DSH 工具表）
 - [x] 无 `assistant/chunk`、无未知事件，日志可被持久化读路径正常加载
 - [x] Windows 下 `piPath` 生效，无 EPERM（经 `cmd.exe /d /s /c` 启动 `pi.cmd`）
+
+---
+
+## 12. 2026-11-20 修补：对话框、思考档位、工具进度、启动路径
+
+改动集中在四个"沉默失败"上——它们不报错，只是让 UI 状态与 pi 的实际行为分叉。
+
+### 12.1 `extension_ui_request`（安全相关）
+
+**之前**：`PiRpcClient#dispatch` 只认 `type: "response"`，其余全部丢进事件流；`PiAgent` 的 `#onPiEvent` 没有对应分支，记录被静默丢弃。pi 侧 `ctx.ui.confirm()` 于是等到自带 `timeout`，由**扩展作者写的默认值**收尾——通常就是"允许"。
+
+**现在**：`rpc.js` 把该子协议分流到独立的 `ui` emitter，并提供 `respondUi(id, body)`；`agent.js` 的 `#onUiRequest` 对 4 个阻塞方法（`select`/`confirm`/`input`/`editor`）**一律应答**，默认 `{ cancelled: true }`；`notify` 等 fire-and-forget 方法只记日志。
+
+实测（`.tmp-test/gate.ts`，一个在 `bash` 前 `ctx.ui.confirm()` 的扩展）：
+
+| 观察项 | 结果 |
+|---|---|
+| `extension_ui_request` 是否到达 | 是，`method: "confirm"` |
+| 插件是否应答 | 是，`{ cancelled: true }` |
+| 工具是否被拦 | 是，`tool_execution_end` 结果含 `denied by host` |
+| 是否还等 timeout | 否 |
+
+配置 `extensionUi: 'allow'` 会把对话框按"确认/首项/空串"放行，仅供调试。
+
+### 12.2 `set_thinking_level`
+
+**之前**：`catalog.js` 把 `thinkingLevelMap` 翻译成 DSH 的 efforts，选择器能选档位，但 `#applyModel` 只发 `set_model`，档位从未下发。
+
+**现在**：`#applyModel` 与工厂的初始路由都下发档位（初始路由串行：先 `set_model` 再 `set_thinking_level`）。
+
+实测（deepseek-flash，levels = `off/low/high/max`）：
+
+| 请求 | pi 实际 |
+|---|---|
+| `medium` | `high`（clamp） |
+| `xhigh` | `max`（clamp） |
+| `bogus` | `off`，且 `success: true` |
+
+最后一行是关键：pi 对未知档位**静默落到 `off`**，等于悄悄关掉推理。因此 `setThinkingLevel` 在本地按 `off/minimal/low/medium/high/xhigh/max` 校验后才下发，并通过 `get_state` 读回实际生效值。
+
+另：`thinking_level_changed` 事件只在扩展或 UI 改动时发出，**RPC 设置不会触发**，所以确认路径必须是 `get_state`。
+
+### 12.3 `tool_execution_update`
+
+DSH 没有"工具进度"这层事件：它自己的 bash 通过 job registry（`job.list` / `job.follow`）向 Web 端流式输出，而向会话日志追加半成品 `tool/result` 会同时污染回放与模型历史。
+
+因此实现为：内存中按 `toolCallId` 保留最近 8KB 预览；`toolProgress: true` 时发 `agent/tool-progress` 实时通知（未知通知对客户端无害，会话日志不写）；`tool_execution_end` 时清理。
+
+实测：`for i in 1 2 3 4; do echo tick$i; sleep 1; done` → 收到 2 次 update，第二次 `partialResult` 为 `tick1\n`。
+
+真正的 UI 渲染需要 DSH 侧提供通道（把 pi 的工具注册成 job 的 pull source 是最贴近现有架构的做法），这条留作后续。
+
+### 12.4 启动路径
+
+`probeModels` 会起一个完整 pi 子进程；Windows 上数秒。它原来在 `apply()` 里 `await`，直接拖慢 `dsh web` 启动。
+
+现在：先 `setFactory`（会话立即可用），目录探测在后台完成后再 `registerAdapter`（注册仍属于本插件 fiber，卸载时一并释放）。
+
+### 12.5 Agent Team 是否可用
+
+**当前不可用**，原因是工具表归属：
+
+- `dsh-agent-team` 本身只提供 durable 任务板（compare-and-set 领取）；teammate 由 `dsh-tool-subagent` / `dsh-tool-subagent-control` 注册的**模型工具**（`subagent`、`subagent_fork`、`send_message`、`list_agents`、`interrupt_agent`）创建。
+- 任务板的 4 个 schema 与"共享任务"指引也由 DSH 侧工具注册与 prompt provider 提供。
+- pi 会话里，模型工具表来自 pi 子进程；`toolSchemas()` 只用于写入 `request/header`（为了让原生 loop 能续接），**并不下发给 pi**。prompt provider 同理不参与。
+
+所以勾选"启用 Agent Team"只会写一条 `team/mode`，模型侧行为不变。
+
+可行的接通方式（两条都要做）：
+
+1. 把 DSH 工具表通过 **MCP** 暴露给 pi（pi 支持 stdio MCP：`pi mcp add ...`、`~/.pi/agent/mcp.json`，或 `-e builtin:mcp`）。插件持有 `ctx.tools`，包一个 stdio MCP server 即可，工具调用回落到 DSH 执行器——顺带把沙箱、审批、jobs 全部接通。
+2. 把 team 的指引文本拼进 `prompt`（pi 自带系统提示词，DSH 的 prompt section 不会进去）。
+
+子 agent 侧本身没有障碍：`dsh-subagent-spawn-in-process` 明确说明它"shares this process and its agent factory"，而本插件已按 `parentAgent` 与 `meta.origin === 'subagent'` 处理创建，因此每个 teammate 会自然变成独立的 pi 子进程。
