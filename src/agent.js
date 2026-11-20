@@ -5,6 +5,8 @@
  * process-local `agent/*` notifications the Web UI consumes.
  */
 
+import { resolve } from 'node:path'
+
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { ToolCallId, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import { createScope } from '@deepseek-ai/dsh-scope'
@@ -69,6 +71,63 @@ function resultText(result) {
     if (text !== '') return text
   }
   return result === undefined ? '' : JSON.stringify(result)
+}
+
+/**
+ * Pi's file tools use `path` and `edits`; DSH's file card and deliverables read
+ * `file_path`, `old_string` and `new_string`. Keep Pi's original fields and add
+ * the DSH aliases to the recorded call only — assistant messages still rebuild
+ * Pi's session from Pi's own schema.
+ */
+function dshFileToolArguments(name, args) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return args
+  if (name !== 'write' && name !== 'edit') return args
+  const path = typeof args.path === 'string' ? args.path
+    : typeof args.file_path === 'string' ? args.file_path : undefined
+  if (path === undefined || path.trim() === '') return args
+  if (name === 'write') return { ...args, file_path: path }
+  const edits = Array.isArray(args.edits) ? args.edits : []
+  const first = edits.find((edit) => edit && typeof edit.oldText === 'string'
+    && typeof edit.newText === 'string' && edit.oldText !== edit.newText)
+  const oldText = typeof args.oldText === 'string' ? args.oldText
+    : typeof args.old_string === 'string' ? args.old_string : first?.oldText
+  const newText = typeof args.newText === 'string' ? args.newText
+    : typeof args.new_string === 'string' ? args.new_string : first?.newText
+  return {
+    ...args,
+    file_path: path,
+    ...(typeof oldText === 'string' ? { old_string: oldText } : {}),
+    ...(typeof newText === 'string' ? { new_string: newText } : {}),
+  }
+}
+
+/** Result-time diff metadata for DSH's file card and deliverables. */
+function fileMutationMeta(name, args, cwd, isError) {
+  if (isError || args === null || typeof args !== 'object' || Array.isArray(args)) return undefined
+  const path = typeof args.path === 'string' ? args.path
+    : typeof args.file_path === 'string' ? args.file_path : undefined
+  if (path === undefined || path.trim() === '') return undefined
+  const absolute = resolve(cwd, path)
+  if (name === 'write') {
+    if (typeof args.content !== 'string') return undefined
+    return { operation: 'write', path: absolute, diffs: [{ path: absolute, oldText: null, newText: args.content }] }
+  }
+  if (name !== 'edit') return undefined
+  const edits = Array.isArray(args.edits)
+    ? args.edits.filter((edit) => edit && typeof edit.oldText === 'string' && typeof edit.newText === 'string')
+    : []
+  if (edits.length === 0 && typeof args.oldText === 'string' && typeof args.newText === 'string') {
+    edits.push({ oldText: args.oldText, newText: args.newText })
+  }
+  if (edits.length === 0 && typeof args.old_string === 'string' && typeof args.new_string === 'string') {
+    edits.push({ oldText: args.old_string, newText: args.new_string })
+  }
+  if (edits.length === 0) return undefined
+  return {
+    operation: 'edit',
+    path: absolute,
+    diffs: edits.map((edit) => ({ path: absolute, oldText: edit.oldText, newText: edit.newText })),
+  }
 }
 
 /** Text carried by one DSH user message. */
@@ -191,6 +250,7 @@ export class PiAgent {
     this.revealMaxChars = streamMaxCharsPerFrame ?? 64
     this.frameRevision = 0
     this.toolCallSeqs = new Map()
+    this.toolCallArgs = new Map()
     this.settleWaiters = []
     this.disposed = false
     this.rpcExited = null
@@ -681,14 +741,16 @@ export class PiAgent {
     this.#drainNow()
     this.#openStep()
     const callId = ToolCallId(String(event.toolCallId ?? ''))
+    const name = String(event.toolName ?? '')
     const callEvent = this.session.append('tool/call', {
       turn: this.turn,
       step: this.step,
       callId,
-      name: String(event.toolName ?? ''),
-      arguments: JSON.stringify(event.args ?? {}),
+      name,
+      arguments: JSON.stringify(dshFileToolArguments(name, event.args ?? {})),
     })
     this.toolCallSeqs.set(String(callId), callEvent.seq)
+    this.toolCallArgs.set(String(callId), event.args ?? {})
   }
 
   #onToolEnd(event) {
@@ -696,7 +758,11 @@ export class PiAgent {
     const callId = ToolCallId(String(event.toolCallId ?? ''))
     this.toolProgress.delete(String(callId))
     const callSeq = this.toolCallSeqs.get(String(callId))
+    const args = this.toolCallArgs.get(String(callId)) ?? event.args ?? {}
+    this.toolCallArgs.delete(String(callId))
     const text = resultText(event.result)
+    const name = String(event.toolName ?? '')
+    const meta = fileMutationMeta(name, args, this.cwd, event.isError === true)
     const message = createToolResultMessage({
       callId,
       content: text === '' ? [] : [{ type: 'text', text }],
@@ -704,7 +770,7 @@ export class PiAgent {
     })
     this.session.append(
       'tool/result',
-      { turn: this.turn, step: this.step, message },
+      { turn: this.turn, step: this.step, message, ...(meta === undefined ? {} : { meta }) },
       { surfaceOp: 'append', ...(callSeq === undefined ? {} : { sourceEventSeqs: [callSeq] }) },
     )
   }

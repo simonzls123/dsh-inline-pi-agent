@@ -8,8 +8,8 @@
  *
  * Usage: PI_PATH=/path/to/pi node scripts/full-e2e.mjs
  */
-import { existsSync, mkdirSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
@@ -143,9 +143,43 @@ await ask(`Run exactly this bash command: echo ok > ${normalized}`)
 check('the guard asked the approval seam', approval.asked.length === 1, `asked=${approval.asked.length}`)
 check('the guarded command ran after approval', existsSync(marker), `marker=${existsSync(marker)}`)
 
-// 4. Both routes coexist in one session log.
+// 4. pi's file tools expose DSH's file-card aliases and result metadata.
+const written = join(root, 'written.txt')
+await ask(`Use the write tool to create ${written.replace(/\\/g, '/')} with exactly this content: hello from pi`)
+const writeEvents = agent.session.ownEvents()
+const writeCall = writeEvents.find((event) => event.type === 'tool/call' && event.data.name === 'write')
+let writeArgs
+try { writeArgs = writeCall === undefined ? null : JSON.parse(writeCall.data.arguments) } catch { writeArgs = null }
+check(
+  'write call exposes file_path to DSH',
+  writeArgs !== null && typeof writeArgs.file_path === 'string' && resolve(writeArgs.file_path) === resolve(written),
+  JSON.stringify(writeArgs),
+)
+const writeResult = writeEvents.find((event) => event.type === 'tool/result'
+  && String(event.data.message?.source?.callId ?? '') === String(writeCall?.data?.callId ?? ''))
+const writeMeta = writeResult?.data?.meta
+check(
+  'write result carries path and diffs',
+  writeMeta !== null && typeof writeMeta === 'object'
+    && resolve(String(writeMeta.path)) === resolve(written)
+    && Array.isArray(writeMeta.diffs)
+    && writeMeta.diffs.some((diff) => typeof diff.newText === 'string' && diff.newText.includes('hello from pi')),
+  JSON.stringify(writeMeta),
+)
+check(
+  'the file was written',
+  existsSync(written) && readFileSync(written, 'utf8').includes('hello from pi'),
+  `written=${existsSync(written)}`,
+)
+
+// 5. All three tool routes coexist in one session log.
 const events = agent.session.ownEvents()
-check('the session recorded both tool routes', events.filter((event) => event.type === 'tool/call').length === 2, String(events.filter((event) => event.type === 'tool/call').length))
+const allCallNames = events.filter((event) => event.type === 'tool/call').map((event) => event.data.name)
+check(
+  'the session recorded all tool routes',
+  ['mcp__dsh__board_create', 'bash', 'write'].every((name) => allCallNames.includes(name)),
+  JSON.stringify(allCallNames),
+)
 
 await handle.dispose()
 await new Promise((resolve) => setTimeout(resolve, 300))
