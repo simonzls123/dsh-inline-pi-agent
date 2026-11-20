@@ -60,7 +60,10 @@ const stubTools = {
   },
 }
 
-const bridge = new DshToolBridge({ tools: stubTools, allow: ['task_create'], logger: () => {} })
+// `getTools` must be called per request: this also covers the load-order case
+// where the registry activates after the plugin.
+let liveTools
+const bridge = new DshToolBridge({ getTools: () => liveTools, allow: ['task_create'], logger: () => {} })
 await bridge.start()
 const { token, box } = bridge.bind()
 box.agent = { id: 'agent-1' }
@@ -76,6 +79,11 @@ const post = async (path, body) => {
 
 // ---- HTTP bridge ----
 {
+  // Before the registry exists the bridge must fail loudly, not silently.
+  const early = await post('/tools', { token })
+  check('a missing tool registry is reported', early.status === 500 && String(early.body.error).includes('no tool registry'), JSON.stringify(early.body))
+
+  liveTools = stubTools
   const listing = await post('/tools', { token })
   check('tools/list reached the bridge', listing.status === 200, JSON.stringify(listing.body))
   const exposed = listing.body.tools ?? []

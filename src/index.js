@@ -76,7 +76,7 @@ export async function apply(ctx, config = {}) {
   if (Array.isArray(config.dshTools) && config.dshTools.length > 0) {
     const names = config.dshTools.filter((name) => typeof name === 'string' && name !== '')
     if (names.length > 0) {
-      bridge = new DshToolBridge({ tools: ctx.get('tools'), allow: names, logger })
+      bridge = new DshToolBridge({ getTools: () => ctx.get('tools'), allow: names, logger })
       await bridge.start()
       bridgeExtension = fileURLToPath(new URL('./bridge/pi-extension.js', import.meta.url))
       ctx.effect(() => () => bridge.close())

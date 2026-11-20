@@ -57,11 +57,14 @@ function reply(res, status, payload) {
 
 export class DshToolBridge {
   /**
-   * @param tools - the `tools` service, or undefined when the deployment has none.
+   * @param getTools - resolves the `tools` service on each call. It is looked up
+   *   lazily on purpose: a bundle's `apply()` can run before the tool registry
+   *   activates, and capturing `undefined` once would disable the bridge for the
+   *   whole process lifetime.
    * @param allow - tool names to expose; anything else is filtered out.
    */
-  constructor({ tools, allow, logger }) {
-    this.tools = tools
+  constructor({ getTools, allow, logger }) {
+    this.getTools = getTools
     this.allow = Array.isArray(allow) ? new Set(allow) : undefined
     this.logger = logger
     this.bindings = new Map()
@@ -124,10 +127,16 @@ export class DshToolBridge {
     await new Promise((resolve) => server.close(() => resolve()))
   }
 
+  /** The live tool registry, or a thrown error naming the deployment gap. */
+  #tools() {
+    const tools = this.getTools()
+    if (tools === undefined) throw new Error('this deployment has no tool registry')
+    return tools
+  }
+
   /** Resolve the tool set one agent may use right now, or undefined. */
   async #toolSet(agent, signal) {
-    const tools = this.tools
-    if (tools === undefined) throw new Error('this deployment has no tool registry')
+    const tools = this.#tools()
     if (agent === undefined) throw new Error('session not ready')
     const modelSelection = agent.model?.current?.()
     const set = await tools.resolve({
@@ -139,7 +148,7 @@ export class DshToolBridge {
   }
 
   #visible(set, agent) {
-    const schemas = this.tools.schemas(agent, set)
+    const schemas = this.#tools().schemas(agent, set)
     return schemas.filter((schema) => this.allow === undefined || this.allow.has(schema.name))
   }
 
@@ -182,11 +191,11 @@ export class DshToolBridge {
       }
       const set = await this.#toolSet(box.agent, signal)
       try {
-        if (this.tools.executable(name, box.agent, set) === undefined) {
+        if (this.#tools().executable(name, box.agent, set) === undefined) {
           reply(res, 404, { error: `no such tool: ${name}` })
           return
         }
-        const batch = await this.tools.execute({
+        const batch = await this.#tools().execute({
           calls: [
             {
               type: 'tool-call',
