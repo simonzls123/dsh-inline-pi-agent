@@ -667,3 +667,71 @@ DSH 没有"工具进度"这层事件：它自己的 bash 通过 job registry（`
 2. 把 team 的指引文本拼进 `prompt`（pi 自带系统提示词，DSH 的 prompt section 不会进去）。
 
 子 agent 侧本身没有障碍：`dsh-subagent-spawn-in-process` 明确说明它"shares this process and its agent factory"，而本插件已按 `parentAgent` 与 `meta.origin === 'subagent'` 处理创建，因此每个 teammate 会自然变成独立的 pi 子进程。
+
+---
+
+## 13. DSH 工具 → pi：MCP 桥（2026-11-20）
+
+§12.5 说"Agent Team 不可用是因为 pi 看不到 DSH 的工具表"。这一节记录接通方式与实测。
+
+### 13.1 为什么必须有桥
+
+pi 子进程是独立进程树，拿不到 `ctx.tools`；而 DSH 的工具是模型工具，只在 DSH 自己的 loop 里注入。两侧都没有现成的跨进程工具通道，所以桥必须自己做。pi 侧的唯一入口是 MCP。
+
+### 13.2 结构
+
+```
+pi 子进程
+  └─ pi 扩展（-e src/bridge/pi-extension.js）
+        └─ pi.registerMcpServer('dsh', { command: node, args: [mcp-server.mjs], exposure: 'direct', env })
+              └─ mcp-server.mjs（stdio MCP, JSON-RPC 2.0 换行分帧）
+                    └─ HTTP 127.0.0.1:<临时端口> + 会话级一次性 token
+                          └─ 插件内 DshToolBridge（src/bridge/server.js）
+                                └─ ctx.tools.resolve / schemas / executable / execute
+```
+
+- token 在 spawn 前绑定（`bridge.bind()` → env），agent 构造后回填（`box.agent = agent`）。工具调用只可能发生在 prompt 之后，因此回填一定早于首次调用。
+- 服务只监听 `127.0.0.1`，端口由系统分配；token 24 字节随机，随插件卸载/agent dispose 失效。
+- 对外只有两个端点：`POST /tools`、`POST /call`。
+
+### 13.3 关键决策：execute 不带 log
+
+`ctx.tools.execute({ calls, signal, agent, toolSet })` **不传 `log`** 时，executor 不写 root `tool/call` / `tool/result` 事件（`executor.d.ts` 明确："Without `log`, return one outcome per input call... omit those events"）。
+
+这正是要的：pi 自己的 `tool_execution_start` / `tool_execution_end` 已经由 `agent.js` 翻译成 `tool/call` / `tool/result`，DSH 侧再写一遍就是双份记录，而且 resume 重建 pi 历史时会重复。
+
+于是分工是：**DSH 负责策略与渲染，pi 负责记账。**
+
+### 13.4 工具命名与暴露面
+
+pi 把 MCP 工具注册为 `mcp__<server>__<tool>`，所以 DSH 的 `team_task_create` 在模型眼里是 `mcp__dsh__team_task_create`。
+
+`dshTools` 是**白名单**，默认空（不启用）。理由：pi 自带 `bash`/`read`/`write`/`edit`，若整表暴露，模型会同时看到两套 bash，且 DSH 那套会绕开 pi 的工具管线。
+
+`exposure: 'direct'` 是必需的：默认的 codemode 暴露会把每次调用包进生成的脚本，实测首次调用就因为生成脚本报 `SyntaxError: invalid redefinition of parameter name` 浪费一轮。
+
+schema 转换直接用 `@deepseek-ai/dsh-tools` 的 `parameterSchemaSpecToJsonSchema`（DSH 参数 DSL 是每属性自带 `required: true` 的映射，MCP 要标准 `required` 数组），不要自己实现——已有官方实现，重复实现必然漂移。
+
+### 13.5 实测
+
+`scripts/bridge-e2e.mjs`：挂 `systemPrompt` + `tools` + `native-tool-executor`，注册一个 `board_create` 工具，用 `dshTools: ['board_create']` 起插件，让 pi 调用它。
+
+| 观察项 | 结果 |
+|---|---|
+| 扩展是否加载 | 是（`-e`，纯 ESM `.js`；用 `.ts` 时若解析失败 pi 直接 exit 1，整会话挂掉） |
+| `tools/list` | 返回 `board_create`，`inputSchema.required = ["title"]` |
+| 模型看到的工具名 | `mcp__dsh__board_create` |
+| `tools/call` | DSH 侧 `execute` 被调用 1 次 |
+| 会话记录 | 只有 1 条 `tool/call` + 1 条 `tool/result`（无重复） |
+| 模型收到的结果 | `board task: from pi` |
+
+另外两点实测细节：
+
+- **`ToolBatchResult.results[i]` 是 `{ callId, result }`**，`outcome` 嵌在 `result` 里。第一版按扁平结构读，导致返回空内容而 `isError: false`——空结果比报错更难发现。
+- `tools` 服务 `inject: ['systemPrompt']`。最小测试环境要挂 `@deepseek-ai/dsh-system-prompt`，否则 `ctx.get('tools')` 永远是 `undefined`。
+
+### 13.6 仍未接通
+
+1. **pi 自带工具不受 DSH 策略管**。要管，得反过来把 pi 的 bash 关掉、只留桥过来的 DSH bash —— 那会改变 pi 的工具语义（后台 job、spill、终端卡片），属于另一个决策。
+2. **DSH 的 prompt section 进不了 pi**。team 的"共享任务板怎么用"指引、plan-mode 旁白都属于这类。要么拼进 prompt，要么做成 pi 扩展的 `before_agent_start` 注入。
+3. **审批**仍需要 pi 侧的 `tool_call` 守卫扩展 + 本插件的对话框桥（§12.1 已具备应答能力，缺的是把 `confirm` 接到 DSH 的人工审批 UI）。

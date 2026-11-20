@@ -41,6 +41,7 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `streamCatchUpFrames` | `6` | How many ticks a full backlog should take to drain, which sets the reveal rate while text is arriving faster than it is shown. |
 | `streamMaxCharsPerFrame` | `64` | Upper bound on characters revealed by one frame. |
 | `piSessionDir` | `~/.dsh/pi-sessions` | Where rebuilt pi session snapshots are written. |
+| `dshTools` | none | DSH tool names to expose to pi over MCP as `mcp__dsh__<name>`. Empty disables the bridge. List only tools pi does not ship itself. |
 | `piArgs` | none | Extra pi child arguments, e.g. `['-e', 'C:/guard/permission.ts']` for an approval gate extension. |
 | `extensionUi` | `deny` | How blocking extension dialogs (`select`/`confirm`/`input`/`editor`) are answered. `deny` always replies `cancelled`; `allow` approves the first option (debugging only). |
 | `toolProgress` | `false` | Publish pi's partial tool output (`tool_execution_update`) as live `agent/tool-progress` notifications. The session log is untouched; the current Web client does not render them yet. |
@@ -54,13 +55,42 @@ Override any of them in your profile patch:
     piPath: 'C:/Users/me/.pi/agent/bin/pi.cmd'
 ```
 
+## Enabling Agent Team and subagents
+
+When `dshTools` is non-empty the plugin serves a token-guarded bridge on 127.0.0.1 and loads a pi extension (`-e`) that registers DSH's tools as the MCP server `dsh`; the model sees `mcp__dsh__<tool>`. Calls run through `ctx.tools.execute` without `log`, so DSH policy and rendering still apply while pi keeps the only durable record of the call.
+
+Expose only what pi lacks (pi already ships bash/read/write/edit, and duplicates make the model choose between two of everything):
+
+```yaml
+- id: pi-agent
+  config:
+    dshTools:
+      - subagent
+      - subagent_fork
+      - send_message
+      - list_agents
+      - interrupt_agent
+      - wait_agent
+      - team_task_create
+      - team_task_get
+      - team_task_list
+      - team_task_update
+```
+
+With that list, **Use Agent Teams** actually works: teammates are created by the `subagent` tool through the same `AgentFactory`, so each teammate is its own pi child.
+
+Two boundaries:
+
+- **Only bridged tools obey DSH policy.** pi's own bash/read/write still execute inside pi, so the sandbox and approval presets do not apply to them.
+- **DSH's team guidance text does not reach pi** (pi uses its own system prompt). The task-board tools work, but the "how to use the board" section is missing; add it to your prompt if the model needs it.
+
 ## Known limitations
 
 - pi executes its own tools, so DSH sandboxing, approval flow and permission presets do not apply to them. To actually gate them, load a pi extension that hooks `tool_call` and calls `ctx.ui.confirm()`, then bridge the dialog — the plugin answers it (default `extensionUi: 'deny'`).
 - The plugin does not dispatch `agent/pre-step`. Hooks that rely on it — time-context injection, the per-step flush, plan-mode narration — do not run for pi sessions.
 - `contextBreakdown.toolsTokens` describes DSH's tool registry rather than pi's tool block; it is declared on `request/header` so a native-loop resume stays valid. Context pressure itself comes from provider-reported usage.
 - The model catalog probe (`probeModels`) spawns one extra pi child, so it no longer blocks plugin load: sessions are served immediately and the adapter is registered when the probe answers.
-- **Agent Team (`dsh-agent-team`) is not available.** `subagent` and the task-board tools are DSH model tools, and a pi child never sees DSH's tool registry. See `CONTRACT.md` §12.5.
+- **Agent Team (`dsh-agent-team`) needs `dshTools`.** `subagent` and the task-board tools are DSH-side model tools; without the bridge a pi child never sees them, and toggling Team mode only records `team/mode`. See `CONTRACT.md` §12.5 and §13.
 
 ## Rollback
 

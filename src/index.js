@@ -10,7 +10,10 @@
  * projections it owns, so this plugin registers them itself.
  */
 
+import { fileURLToPath } from 'node:url'
+
 import { PiCatalogAdapter, probeModels } from './catalog.js'
+import { DshToolBridge } from './bridge/server.js'
 import { PiAgentFactory } from './factory.js'
 import { projectionDefinitions } from './projections.js'
 
@@ -65,6 +68,21 @@ export async function apply(ctx, config = {}) {
     })()
   }
 
+  // Expose DSH's own tools to pi over MCP. Off unless the deployment names the
+  // tools to expose: pi already ships bash/read/write/edit, so a blanket bridge
+  // would offer two of everything.
+  let bridge
+  let bridgeExtension
+  if (Array.isArray(config.dshTools) && config.dshTools.length > 0) {
+    const names = config.dshTools.filter((name) => typeof name === 'string' && name !== '')
+    if (names.length > 0) {
+      bridge = new DshToolBridge({ tools: ctx.get('tools'), allow: names, logger })
+      await bridge.start()
+      bridgeExtension = fileURLToPath(new URL('./bridge/pi-extension.js', import.meta.url))
+      ctx.effect(() => () => bridge.close())
+    }
+  }
+
   const factory = new PiAgentFactory(ctx, {
     piPath: config.piPath ?? 'pi',
     cwd: config.cwd ?? process.cwd(),
@@ -76,6 +94,8 @@ export async function apply(ctx, config = {}) {
     ...(config.extensionUi === undefined ? {} : { extensionUi: config.extensionUi }),
     ...(config.toolProgress === undefined ? {} : { toolProgress: config.toolProgress }),
     ...(Array.isArray(config.piArgs) ? { piArgs: config.piArgs.filter((arg) => typeof arg === 'string') } : {}),
+    ...(bridge === undefined ? {} : { bridge }),
+    ...(bridgeExtension === undefined ? {} : { bridgeExtension }),
     ...(positive(config.streamPaceMs) ? { streamPaceMs: Math.min(200, Math.max(8, config.streamPaceMs)) } : {}),
     ...(positive(config.streamCatchUpFrames) ? { streamCatchUpFrames: Math.max(1, Math.round(config.streamCatchUpFrames)) } : {}),
     ...(positive(config.streamMaxCharsPerFrame) ? { streamMaxCharsPerFrame: Math.max(1, Math.round(config.streamMaxCharsPerFrame)) } : {}),

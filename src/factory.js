@@ -84,11 +84,19 @@ export class PiAgentFactory {
       logger: this.options.logger,
     })
 
+    // Reserve the bridge token before spawning: the child needs it in its env,
+    // and tool calls can only arrive after a prompt — later than construction.
+    const reservation = this.options.bridge?.bind()
+    const extraArgs = [
+      ...(Array.isArray(this.options.piArgs) ? this.options.piArgs : []),
+      ...(this.options.bridgeExtension === undefined ? [] : ['-e', this.options.bridgeExtension]),
+    ]
     const rpc = new PiRpcClient({
       piPath: this.options.piPath,
       cwd,
       ...(sessionFile === undefined ? {} : { sessionFile }),
-      ...(Array.isArray(this.options.piArgs) ? { extraArgs: this.options.piArgs } : {}),
+      ...(extraArgs.length === 0 ? {} : { extraArgs }),
+      ...(reservation === undefined ? {} : { extraEnv: this.options.bridge.envFor(reservation.token) }),
       logger: this.options.logger,
     })
     const requested = { ...routeOptions(this.options.model), ...agentOptions }
@@ -110,6 +118,9 @@ export class PiAgentFactory {
       ...(this.options.extensionUi === undefined ? {} : { extensionUi: this.options.extensionUi }),
       ...(this.options.toolProgress === undefined ? {} : { toolProgress: this.options.toolProgress }),
     })
+    // Tool calls can only arrive after a prompt, so filling the box here is
+    // always earlier than the bridge needs it.
+    if (reservation !== undefined) reservation.box.agent = agent
     // Align pi's route with the route this session already shows: prefer the
     // configured mapping, else try the DSH route verbatim (identical names).
     const requestedRoute = requested.provider === undefined || requested.model === undefined
@@ -142,6 +153,7 @@ export class PiAgentFactory {
           try {
             await stored?.handle.close()
           } finally {
+            if (reservation !== undefined) this.options.bridge.unbind(reservation.token)
             detachAgent?.()
             detachSession?.()
           }

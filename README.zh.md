@@ -41,6 +41,7 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `streamCatchUpFrames` | `6` | 完整积压应在多少拍内排空，用来决定追赶速率。 |
 | `streamMaxCharsPerFrame` | `64` | 单帧最多揭示的字符数。 |
 | `piSessionDir` | `~/.dsh/pi-sessions` | 重建的 pi 会话快照目录。 |
+| `dshTools` | 空 | 要把哪些 **DSH 工具** 通过 MCP 暴露给 pi（`mcp__dsh__<name>`）。留空则不启用；建议只列 pi 自己没有的工具，例如 Agent Team 那一套。 |
 | `piArgs` | 空 | 追加给 pi 子进程的参数，如 `['-e', 'C:/guard/permission.ts']`（审批网关扩展）。 |
 | `extensionUi` | `deny` | pi 扩展发起阻塞式对话框（`select`/`confirm`/`input`/`editor`）时如何应答。`deny` 一律回 `cancelled`，`allow` 按“确认/首项/空串”放行（仅调试用）。 |
 | `toolProgress` | `false` | 把 pi 的工具中间输出（`tool_execution_update`）作为 `agent/tool-progress` 实时通知发布。会话日志不受影响；当前 Web 客户端还不渲染该通知。 |
@@ -54,13 +55,42 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
     piPath: 'C:/Users/me/.pi/agent/bin/pi.cmd'
 ```
 
+## 开启 Agent Team / 子 agent
+
+`dshTools` 非空时，插件在 127.0.0.1 起一个带一次性 token 的桥，并用 `-e` 给 pi 加载一个扩展，把 DSH 工具注册成 MCP server `dsh`；模型看到的名字是 `mcp__dsh__<tool>`。工具调用走 `ctx.tools.execute`（不带 `log`），所以 DSH 侧策略与渲染照常生效，而**会话日志仍由 pi 独占记录**，不会重复。
+
+推荐只暴露 pi 自己不带的工具（pi 自带 bash/read/write/edit，重复暴露会让模型面对两套）：
+
+```yaml
+- id: pi-agent
+  config:
+    dshTools:
+      - subagent
+      - subagent_fork
+      - send_message
+      - list_agents
+      - interrupt_agent
+      - wait_agent
+      - team_task_create
+      - team_task_get
+      - team_task_list
+      - team_task_update
+```
+
+装上这组后，「启用 Agent Team」才真的生效：teammate 由 `subagent` 工具创建，走的是同一个 AgentFactory，所以每个 teammate 是一个独立的 pi 子进程。
+
+两个要知道的边界：
+
+- **只有 DSH 工具受 DSH 策略管**。pi 自带的 bash/read/write 仍然是 pi 自己执行，沙箱与审批不适用（见下方已知限制）。
+- **DSH 的 team 指引文本进不了 pi**（pi 用自己的系统提示词）。任务板工具能用，但「怎么用共享任务板」的说明缺失，必要时在 prompt 里补。
+
 ## 已知限制
 
 - pi 自己执行工具，因此 DSH 的沙箱、审批与权限预设不作用于这些工具。要真正拦住 pi 的工具，需要 `piArgs: ['-e', '<guard.ts>']` 加载一个用 `tool_call` 钩子 + `ctx.ui.confirm()` 的 pi 扩展，再由本插件把对话框桥出去（当前 `extensionUi: 'deny'` 会让它一律按“拒绝”处理）。
 - 插件不派发 `agent/pre-step`，依赖它的钩子（时间注入、每步 flush、plan-mode 旁白）在 pi 会话中不生效。
 - `contextBreakdown.toolsTokens` 描述的是 DSH 工具注册表而非 pi 的工具块（写在 `request/header` 上是为了让原生 loop 能续接）；上下文压力本身来自 provider 上报的 usage。
 - 模型目录探测（`probeModels`）会额外起一个 pi 子进程，因此**不再阻塞插件加载**：会话先可用，目录适配器稍后补注册。首次打开模型选择器若扑空，等几秒再打开。
-- Agent Team（`dsh-agent-team`）**当前不可用**：`subagent`/任务板是 DSH 侧注册的模型工具，而 pi 子进程只用自己的工具表，模型看不到它们。详见 `CONTRACT.md` §12。
+- Agent Team（`dsh-agent-team`）**需要显式开启**：`subagent` 与任务板是 DSH 侧注册的模型工具，pi 子进程看不到 DSH 的工具表，必须先通过 `dshTools` 暴露（见上一节）。默认不暴露时，勾选「启用 Agent Team」只会写一条 `team/mode`，模型行为不变。
 
 ## 回退
 

@@ -29,7 +29,7 @@ function resolveSpawn(piPath, args) {
 }
 
 export class PiRpcClient {
-  constructor({ piPath = 'pi', cwd, sessionFile, logger, extraArgs }) {
+  constructor({ piPath = 'pi', cwd, sessionFile, logger, extraArgs, extraEnv }) {
     this.cwd = cwd
     this.logger = logger
     this.closed = false
@@ -50,7 +50,7 @@ export class PiRpcClient {
     const { file, args: spawnArgs } = resolveSpawn(piPath, args)
     this.proc = spawn(file, spawnArgs, {
       cwd,
-      env: process.env,
+      env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     })
