@@ -87,16 +87,22 @@ export class PiAgentFactory {
     // Reserve the bridge token before spawning: the child needs it in its env,
     // and tool calls can only arrive after a prompt — later than construction.
     const reservation = this.options.bridge?.bind()
+    const guardExtension = this.options.guardExtension
     const extraArgs = [
       ...(Array.isArray(this.options.piArgs) ? this.options.piArgs : []),
       ...(this.options.bridgeExtension === undefined ? [] : ['-e', this.options.bridgeExtension]),
+      ...(guardExtension === undefined ? [] : ['-e', guardExtension]),
     ]
+    const extraEnv = {
+      ...(reservation === undefined ? {} : this.options.bridge.envFor(reservation.token)),
+      ...(guardExtension === undefined ? {} : { DSH_GUARD_TOOLS: (this.options.guardTools ?? []).join(',') }),
+    }
     const rpc = new PiRpcClient({
       piPath: this.options.piPath,
       cwd,
       ...(sessionFile === undefined ? {} : { sessionFile }),
       ...(extraArgs.length === 0 ? {} : { extraArgs }),
-      ...(reservation === undefined ? {} : { extraEnv: this.options.bridge.envFor(reservation.token) }),
+      ...(Object.keys(extraEnv).length === 0 ? {} : { extraEnv }),
       logger: this.options.logger,
     })
     const requested = { ...routeOptions(this.options.model), ...agentOptions }
@@ -117,6 +123,7 @@ export class PiAgentFactory {
       ...(this.options.modelInfo === undefined ? {} : { modelInfo: this.options.modelInfo }),
       ...(this.options.extensionUi === undefined ? {} : { extensionUi: this.options.extensionUi }),
       ...(this.options.toolProgress === undefined ? {} : { toolProgress: this.options.toolProgress }),
+      ...(this.options.approvalTimeoutMs === undefined ? {} : { approvalTimeoutMs: this.options.approvalTimeoutMs }),
     })
     // Tool calls can only arrive after a prompt, so filling the box here is
     // always earlier than the bridge needs it.

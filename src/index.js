@@ -83,6 +83,17 @@ export async function apply(ctx, config = {}) {
     }
   }
 
+  // Guard pi's own tools with DSH's approval seam. `guard` accepts `true` (the
+  // default list: bash/write/edit), an array of tool names, or `false`.
+  const guardTools = config.guard === true
+    ? ['bash', 'write', 'edit']
+    : Array.isArray(config.guard)
+      ? config.guard.filter((name) => typeof name === 'string' && name !== '')
+      : []
+  const guardExtension = guardTools.length === 0
+    ? undefined
+    : fileURLToPath(new URL('./guard/guard-extension.js', import.meta.url))
+
   const factory = new PiAgentFactory(ctx, {
     piPath: config.piPath ?? 'pi',
     cwd: config.cwd ?? process.cwd(),
@@ -93,9 +104,11 @@ export async function apply(ctx, config = {}) {
     modelInfo: (provider, model) => catalog.lookup?.(provider, model),
     ...(config.extensionUi === undefined ? {} : { extensionUi: config.extensionUi }),
     ...(config.toolProgress === undefined ? {} : { toolProgress: config.toolProgress }),
+    ...(positive(config.approvalTimeoutMs) ? { approvalTimeoutMs: config.approvalTimeoutMs } : {}),
     ...(Array.isArray(config.piArgs) ? { piArgs: config.piArgs.filter((arg) => typeof arg === 'string') } : {}),
     ...(bridge === undefined ? {} : { bridge }),
     ...(bridgeExtension === undefined ? {} : { bridgeExtension }),
+    ...(guardExtension === undefined ? {} : { guardExtension, guardTools }),
     ...(positive(config.streamPaceMs) ? { streamPaceMs: Math.min(200, Math.max(8, config.streamPaceMs)) } : {}),
     ...(positive(config.streamCatchUpFrames) ? { streamCatchUpFrames: Math.max(1, Math.round(config.streamCatchUpFrames)) } : {}),
     ...(positive(config.streamMaxCharsPerFrame) ? { streamMaxCharsPerFrame: Math.max(1, Math.round(config.streamMaxCharsPerFrame)) } : {}),

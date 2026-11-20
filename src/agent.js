@@ -97,6 +97,24 @@ function uiTitle(request) {
 }
 
 /**
+ * Read the guard's question back into an approval request.
+ *
+ * The guard sends `tool: <name>` as the first line of `message` (see
+ * src/guard/guard-extension.js). An unrecognized shape still gets asked, under
+ * a neutral label: refusing to ask would silently allow the call.
+ */
+function parseGuardQuestion(request) {
+  const message = typeof request.message === 'string' ? request.message : ''
+  const newline = message.indexOf('\n')
+  const first = newline === -1 ? message : message.slice(0, newline)
+  const detail = newline === -1 ? '' : message.slice(newline + 1).trim()
+  const match = /^tool:\s*(\S+)$/.exec(first.trim())
+  if (match === null) return { toolName: 'pi-tool', reason: uiTitle(request) || undefined }
+  const reason = detail === '' ? undefined : detail.length > 500 ? `${detail.slice(0, 500)}…` : detail
+  return { toolName: match[1], reason }
+}
+
+/**
  * The permissive answer for one dialog method.
  *
  * Only used when `extensionUi: 'allow'` is configured: the default is to answer
@@ -121,7 +139,7 @@ function allowUi(method, request) {
 }
 
 export class PiAgent {
-  constructor({ ctx, session, agentOptions, rpc, cwd, logger, modelMap, modelInfo, startSource, requestHeader, toolSchemas, streamPaceMs, streamCatchUpFrames, streamMaxCharsPerFrame, extensionUi, toolProgress }) {
+  constructor({ ctx, session, agentOptions, rpc, cwd, logger, modelMap, modelInfo, startSource, requestHeader, toolSchemas, streamPaceMs, streamCatchUpFrames, streamMaxCharsPerFrame, extensionUi, toolProgress, approvalTimeoutMs }) {
     this.id = session.id
     this.session = session
     this.options = agentOptions ?? {}
@@ -135,7 +153,9 @@ export class PiAgent {
     this.requestHeader = requestHeader !== false
     // `deny` answers every blocking extension dialog with `cancelled`, so an
     // extension can never hang the run or silently approve its own action.
-    this.extensionUi = extensionUi === 'allow' ? 'allow' : 'deny'
+    this.extensionUi = extensionUi === 'allow' || extensionUi === 'approval' ? extensionUi : 'deny'
+    // A pending human decision must not pin a turn forever.
+    this.approvalTimeoutMs = Number.isFinite(approvalTimeoutMs) && approvalTimeoutMs > 0 ? approvalTimeoutMs : 300000
     this.toolProgressEnabled = toolProgress === true
     this.toolProgress = new Map()
     this.thinkingLevel = undefined
@@ -716,10 +736,61 @@ export class PiAgent {
       this.logger?.(`[pi:ui] ${method} ${uiTitle(request)}`)
       return
     }
+    // `approval` mode routes a guard's yes/no question to DSH's approval seam, so
+    // the session's approval policy decides and the audit log records it.
+    if (this.extensionUi === 'approval' && method === 'confirm') {
+      void this.#askApproval(id, request)
+      return
+    }
     const answer = this.extensionUi === 'allow' ? allowUi(method, request) : { cancelled: true }
     this.logger?.(`[pi:ui] ${method} "${uiTitle(request)}" -> ${JSON.stringify(answer)}`)
     try {
       this.rpc.respondUi(id, answer)
+    } catch (error) {
+      this.logger?.(`[pi:ui] respond failed: ${String(error)}`)
+    }
+  }
+
+  /**
+   * Ask DSH's approval seam and answer pi with the verdict.
+   *
+   * Fails closed on every path: a missing seam, a throwing answerer, or a
+   * timeout all answer `confirmed: false`. `never`-policy sessions come back
+   * `rejected` without prompting anyone, which is exactly the preset's meaning.
+   */
+  async #askApproval(id, request) {
+    const { toolName, reason } = parseGuardQuestion(request)
+    const approval = this.ctx.get('approval')
+    if (approval === undefined) {
+      this.logger?.('[pi:ui] no approval seam; declining')
+      this.#respondUi(id, { confirmed: false })
+      return
+    }
+    // `never` means "decide without asking" — a preset that grants full access
+    // must not turn every guarded tool into a rejection.
+    if (approval.overrideOf?.(this.session) === 'never') {
+      this.logger?.(`[pi:ui] ${toolName} allowed by the session's never policy`)
+      this.#respondUi(id, { confirmed: true })
+      return
+    }
+    try {
+      const outcome = await approval.request({
+        agent: this,
+        toolName,
+        ...(reason === undefined ? {} : { reason }),
+        signal: AbortSignal.timeout(this.approvalTimeoutMs),
+      })
+      this.logger?.(`[pi:ui] approval ${toolName} -> ${outcome}`)
+      this.#respondUi(id, { confirmed: outcome === 'allowed-once' })
+    } catch (error) {
+      this.logger?.(`[pi:ui] approval failed: ${String(error)}`)
+      this.#respondUi(id, { confirmed: false })
+    }
+  }
+
+  #respondUi(id, body) {
+    try {
+      this.rpc.respondUi(id, body)
     } catch (error) {
       this.logger?.(`[pi:ui] respond failed: ${String(error)}`)
     }

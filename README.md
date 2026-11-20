@@ -43,7 +43,9 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `piSessionDir` | `~/.dsh/pi-sessions` | Where rebuilt pi session snapshots are written. |
 | `dshTools` | none | DSH tool names to expose to pi over MCP as `mcp__dsh__<name>`. Empty disables the bridge. List only tools pi does not ship itself. |
 | `piArgs` | none | Extra pi child arguments, e.g. `['-e', 'C:/guard/permission.ts']` for an approval gate extension. |
-| `extensionUi` | `deny` | How blocking extension dialogs (`select`/`confirm`/`input`/`editor`) are answered. `deny` always replies `cancelled`; `allow` approves the first option (debugging only). |
+| `extensionUi` | `deny` | How blocking extension dialogs are answered: `deny` replies `cancelled`; `approval` routes `confirm` through DSH's approval seam; `allow` approves the first option (debugging only). |
+| `guard` | off | Gate pi's **own** tools behind DSH approval via pi's `tool_call` hook. `true` means `[bash, write, edit]`; an array picks tools. Requires `extensionUi: 'approval'`. |
+| `approvalTimeoutMs` | `300000` | Upper bound for one approval; a timeout counts as a rejection (fail closed). |
 | `toolProgress` | `false` | Publish pi's partial tool output (`tool_execution_update`) as live `agent/tool-progress` notifications. The session log is untouched; the current Web client does not render them yet. |
 | `debug` | `false` | Protocol and lifecycle diagnostics. |
 

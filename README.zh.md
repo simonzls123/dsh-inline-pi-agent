@@ -43,7 +43,9 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `piSessionDir` | `~/.dsh/pi-sessions` | 重建的 pi 会话快照目录。 |
 | `dshTools` | 空 | 要把哪些 **DSH 工具** 通过 MCP 暴露给 pi（`mcp__dsh__<name>`）。留空则不启用；建议只列 pi 自己没有的工具，例如 Agent Team 那一套。 |
 | `piArgs` | 空 | 追加给 pi 子进程的参数，如 `['-e', 'C:/guard/permission.ts']`（审批网关扩展）。 |
-| `extensionUi` | `deny` | pi 扩展发起阻塞式对话框（`select`/`confirm`/`input`/`editor`）时如何应答。`deny` 一律回 `cancelled`，`allow` 按“确认/首项/空串”放行（仅调试用）。 |
+| `extensionUi` | `deny` | pi 扩展发起阻塞式对话框时如何应答：`deny` 一律 `cancelled`；`approval` 把 `confirm` 转成 DSH 的审批请求（会话策略决定是否弹窗）；`allow` 按“确认/首项/空串”放行（仅调试）。 |
+| `guard` | 关 | 用 pi 的 `tool_call` 钩子把 pi **自己**的工具拦到审批前面。`true` = `[bash, write, edit]`，也可给数组。需要 `extensionUi: 'approval'`。 |
+| `approvalTimeoutMs` | `300000` | 单次审批等待上限；超时按拒绝处理（fail closed）。 |
 | `toolProgress` | `false` | 把 pi 的工具中间输出（`tool_execution_update`）作为 `agent/tool-progress` 实时通知发布。会话日志不受影响；当前 Web 客户端还不渲染该通知。 |
 | `debug` | `false` | 协议与生命周期日志。 |
 
@@ -84,9 +86,33 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 - **只有 DSH 工具受 DSH 策略管**。pi 自带的 bash/read/write 仍然是 pi 自己执行，沙箱与审批不适用（见下方已知限制）。
 - **DSH 的 team 指引文本进不了 pi**（pi 用自己的系统提示词）。任务板工具能用，但「怎么用共享任务板」的说明缺失，必要时在 prompt 里补。
 
+## 让 DSH 的权限预设管住 pi 自己的工具
+
+pi 执行自己的工具，DSH 的审批策略原本看不到它们。开启下面两项后，pi 的 `bash`/`write`/`edit` 会先问 DSH：
+
+```yaml
+- id: pi-agent
+  config:
+    extensionUi: approval     # confirm 走 DSH 审批立面
+    guard: true               # 等价于 [bash, write, edit]
+```
+
+链路：pi 的 `tool_call` 钩子 → `ctx.ui.confirm()` → `extension_ui_request` → 插件调 `ctx.approval.request()` → 浏览器审批卡片（`dsh-client-ui-approval`）→ 结果回给 pi 决定放行或 block。
+
+语义与权限预设一致：
+
+| 会话审批策略 | 行为 |
+|---|---|
+| `ask`（workspace-write 等） | 弹窗询问；拒绝则工具被 block，模型收到失败结果 |
+| `never`（danger-full-access） | **不问直接放行**（预设的含义就是“别再问了”） |
+
+失败一律关闭（fail closed）：没有审批服务、没有观众、超时、审批链路抛错，全部按拒绝处理。审计落在会话日志的 `approval/asked` / `approval/decided`。
+
+> 注意：`guard` 只覆盖 pi **自己的**工具。经 `dshTools` 桥过来的 DSH 工具本来就受 DSH 策略管，不需要重复拦截。
+
 ## 已知限制
 
-- pi 自己执行工具，因此 DSH 的沙箱、审批与权限预设不作用于这些工具。要真正拦住 pi 的工具，需要 `piArgs: ['-e', '<guard.ts>']` 加载一个用 `tool_call` 钩子 + `ctx.ui.confirm()` 的 pi 扩展，再由本插件把对话框桥出去（当前 `extensionUi: 'deny'` 会让它一律按“拒绝”处理）。
+- **pi 自己的工具**只有配了 `guard` 才受 DSH 审批约束；未配置时（默认）它们仍由 pi 直接执行。
 - 插件不派发 `agent/pre-step`，依赖它的钩子（时间注入、每步 flush、plan-mode 旁白）在 pi 会话中不生效。
 - `contextBreakdown.toolsTokens` 描述的是 DSH 工具注册表而非 pi 的工具块（写在 `request/header` 上是为了让原生 loop 能续接）；上下文压力本身来自 provider 上报的 usage。
 - 模型目录探测（`probeModels`）会额外起一个 pi 子进程，因此**不再阻塞插件加载**：会话先可用，目录适配器稍后补注册。首次打开模型选择器若扑空，等几秒再打开。

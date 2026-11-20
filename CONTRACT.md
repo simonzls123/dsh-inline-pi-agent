@@ -735,3 +735,70 @@ schema 转换直接用 `@deepseek-ai/dsh-tools` 的 `parameterSchemaSpecToJsonSc
 1. **pi 自带工具不受 DSH 策略管**。要管，得反过来把 pi 的 bash 关掉、只留桥过来的 DSH bash —— 那会改变 pi 的工具语义（后台 job、spill、终端卡片），属于另一个决策。
 2. **DSH 的 prompt section 进不了 pi**。team 的"共享任务板怎么用"指引、plan-mode 旁白都属于这类。要么拼进 prompt，要么做成 pi 扩展的 `before_agent_start` 注入。
 3. **审批**仍需要 pi 侧的 `tool_call` 守卫扩展 + 本插件的对话框桥（§12.1 已具备应答能力，缺的是把 `confirm` 接到 DSH 的人工审批 UI）。
+
+---
+
+## 14. 审批网关：让 DSH 的权限预设管住 pi 自己的工具（2026-11-20）
+
+§13.6 剩下的第 3 条。这一节记录接通方式、实测，以及一个必须处理好的语义陷阱。
+
+### 14.1 为什么不能用 pi 的 `--approve`
+
+pi 根本没有逐工具审批（`docs/security.md` 明说它不逐个工具征求同意）。唯一能拦的钩子是扩展的 `tool_call`：它在工具执行前触发，可以返回 `{ block: true, reason }`。
+
+### 14.2 链路
+
+```
+pi 的 tool_call 钩子（src/guard/guard-extension.js）
+  └─ ctx.ui.confirm(title, "tool: bash\n<command>")
+        └─ extension_ui_request（§12.1 已具备应答通道）
+              └─ 插件 #askApproval → ctx.approval.request({ agent, toolName, reason, signal })
+                    └─ approval/request 瀑布 → dsh-client-ui-approval（浏览器卡片）
+                          └─ allowed-once / rejected / cancelled / unavailable
+                                └─ respondUi({ confirmed: outcome === 'allowed-once' })
+                                      └─ pi 放行或被 block
+```
+
+两侧都随本包发布，因此用一个显式约定传结构化信息：`confirm` 的 `message` 首行是 `tool: <name>`，其余是给人看的细节。解析失败时插件仍会询问（用 `pi-tool` 作审计标签）——不解析就等于静默放行。
+
+### 14.3 语义陷阱：`never` 不等于“拒绝”
+
+`ApprovalService.request()` 在 `never` 策略下**确定性地返回 `rejected`**（不弹窗）。如果插件把这个 `rejected` 当成“人类说不”，那么默认预设 `danger-full-access`（approval = `never`）会把 pi 的每个 bash 都拦死——正好与预设的含义相反。
+
+所以插件先读策略再问：
+
+```js
+if (approval.overrideOf(session) === 'never') → respondUi({ confirmed: true })   // 不问，放行
+else → approval.request(...)                                                     // ask：问人
+```
+
+`overrideOf()` 读的是会话初始化时由 `setApprovalPolicy` 写入的 `approval/policy` 覆盖；预设切换会写同名事件，因此切换预设即时生效。
+
+### 14.4 失败一律关闭
+
+| 情况 | 结果 |
+|---|---|
+| 部署没挂 `dsh-user-approval` | `confirmed: false`（工具被 block） |
+| 有服务但没有回答者 | `unavailable` → `confirmed: false` |
+| 等待超过 `approvalTimeoutMs`（默认 300s） | signal 中止 → `cancelled` → `confirmed: false` |
+| `approval.request` 抛错 | `confirmed: false` |
+
+pi 侧同样 fail closed：`ctx.ui.confirm()` 返回 `undefined`（超时/取消/未应答）不等于 `true`，于是 `{ block: true }`。
+
+### 14.5 实测
+
+`scripts/approval-e2e.mjs`：最小服务栈 + 一个按剧本作答的 `approval` 桩，`extensionUi: 'approval'`、`guard: ['bash']`，让 pi 跑 `echo hi > marker.txt`，用文件是否存在判定命令有没有真的跑。
+
+| 场景 | 审批被问 | 命令执行 | 模型看到的 |
+|---|---|---|---|
+| 回答 `rejected` | 1 次 | 否（marker 不存在） | 工具结果 `isError: true` |
+| 回答 `allowed-once` | 1 次 | 是 | 正常结果 |
+| 会话策略 `never` | **0 次** | 是 | 正常结果 |
+
+同时验证了问题里带上了工具名（`bash`）和命令细节（用于审计的 `reason`）。
+
+### 14.6 仍未覆盖
+
+1. **`read` 类工具没有拦**（默认列表只有 `bash`/`write`/`edit`）。读操作一般不需要审批，需要时把 `guard` 写成数组即可。
+2. **`mcp__dsh__*` 工具不需要这条链路**：它们本来就经 `ctx.tools.execute`，DSH 的策略在那一侧生效。
+3. **pi 的 `bash` 仍然不是 DSH 的 bash**：审批能拦住它，但沙箱模式、后台 job、spill、终端卡片这些仍是 pi 自己的语义。要统一就得关掉 pi 的 bash、只留桥过来的 DSH bash（见 §13.6 第 1 条）。
