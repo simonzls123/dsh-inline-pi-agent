@@ -275,6 +275,12 @@ await ask('Reply with exactly: MODEL_SELECT_OK')
 const selectedAssistant = agent.session.ownEvents().filter((event) => event.type === 'assistant/message').at(-1)
 const selectedModel = selectedAssistant?.data?.message?.source?.model
 check('model selection reaches pi before the next prompt', selectedModel === 'deepseek-v4-pro', String(selectedModel))
+const lastHeader = agent.session.ownEvents().filter((event) => event.type === 'request/header').at(-1)
+check(
+  'request header records the applied thinking level',
+  lastHeader?.data?.header?.config?.reasoningEffort === 'high',
+  JSON.stringify(lastHeader?.data?.header?.config),
+)
 
 await handle.dispose()
 await new Promise((resolve) => setTimeout(resolve, 300))

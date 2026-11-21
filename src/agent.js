@@ -249,6 +249,7 @@ export class PiAgent {
     this.presentFilesEnabled = presentFiles !== false
     this.toolProgress = new Map()
     this.thinkingLevel = undefined
+    this.appliedThinkingLevel = undefined
 
     this._status = 'idle'
     this.scope = createScope(ctx, this)
@@ -499,11 +500,12 @@ export class PiAgent {
     if (this.requestHeader === false) return
     const selection = this.model.current()
     if (selection === undefined) return
+    const effort = this.appliedThinkingLevel ?? selection.reasoningEffort
 
     const config = {
       provider: selection.provider,
       model: this.headerModels?.[selection.model] ?? selection.model,
-      ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+      ...(effort === undefined ? {} : { reasoningEffort: effort }),
     }
     // Declaring the registry's tools keeps a later native-loop resume
     // consistent: an empty tool list would make every tool look newly added
@@ -575,12 +577,13 @@ export class PiAgent {
       case 'compaction_end':
         void this.#finishCompaction(event)
         return
-      case 'thinking_level_changed':
-        // Only extension- or UI-driven changes emit this; an RPC
-        // `set_thinking_level` is confirmed by reading `get_state` instead.
-        this.thinkingLevel = typeof event.level === 'string' ? event.level : undefined
-        this.logger?.(`[pi] thinking level now ${String(this.thinkingLevel)}`)
+      case 'thinking_level_changed': {
+        const level = typeof event.level === 'string' ? event.level : undefined
+        this.thinkingLevel = level
+        this.appliedThinkingLevel = level
+        this.logger?.(`[pi] thinking level now ${String(level)}`)
         return
+      }
       case 'agent_settled': {
         this.settled = true
         const waiters = this.settleWaiters.splice(0)
@@ -851,6 +854,7 @@ export class PiAgent {
   }
 
   #onToolEnd(event) {
+    this.#drainNow()
     this.#openStep()
     const callId = ToolCallId(String(event.toolCallId ?? ''))
     this.toolProgress.delete(String(callId))
@@ -1060,9 +1064,11 @@ export class PiAgent {
     const modelId = route.slice(separator + 1)
     const level = selection.reasoningEffort
     this.modelSync = this.modelSync.then(async () => {
+      this.appliedThinkingLevel = undefined
       await this.rpc.setModel(provider, modelId)
       if (typeof level === 'string' && level !== '') {
         const applied = await this.rpc.setThinkingLevel(level)
+        this.appliedThinkingLevel = applied ?? level
         if (applied !== undefined && applied !== level) {
           this.logger?.(`[pi] thinking level ${level} clamped to ${applied}`)
         }
