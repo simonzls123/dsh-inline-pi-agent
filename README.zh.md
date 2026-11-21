@@ -17,7 +17,7 @@
 要求：DSH `0.2.2-rc.1` 或兼容版本；`pi` 在 `PATH` 上（或显式指定 `piPath`）。
 
 ```sh
-dsh plugin --profile web add github:Komorebi-Nine/dsh-inline-pi-agent
+dsh plugin --profile web add github:simonzls123/dsh-inline-pi-agent
 ```
 
 bundle 层会禁用 `agent-loop`、DSH 侧压缩与工具结果裁剪，并插入 `pi-agent` 行。之后重启 `dsh web`，或依赖 profile 的 patch 热重载。

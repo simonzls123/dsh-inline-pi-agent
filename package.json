@@ -29,11 +29,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Komorebi-Nine/dsh-inline-pi-agent.git"
+    "url": "git+https://github.com/simonzls123/dsh-inline-pi-agent.git"
   },
-  "homepage": "https://github.com/Komorebi-Nine/dsh-inline-pi-agent#readme",
+  "homepage": "https://github.com/simonzls123/dsh-inline-pi-agent#readme",
   "bugs": {
-    "url": "https://github.com/Komorebi-Nine/dsh-inline-pi-agent/issues"
+    "url": "https://github.com/simonzls123/dsh-inline-pi-agent/issues"
   },
   "engines": {
     "dsh": "^0.2.2-rc.1"

@@ -2,6 +2,7 @@
 
 Upstream: https://github.com/simonzls123/dsh-inline-pi-agent
 Base commit: 2b93905 ("fix: drain tool-end text and report the applied thinking level", 0.2.0)
+Release commit: 00d6a58 (0.2.3, tag v0.2.3 on `main`)
 Local version: 0.2.3
 
 `src/` started as a verbatim copy of the base commit. Everything below is a local
@@ -102,7 +103,7 @@ immediately, the capacity refusal, and idle reclaim followed by resume.
 - Note: a process that loaded the old code keeps writing invalid records after the
   files on disk are fixed — restart the App / gateway before resuming.
 
-## 0.2.0 fixes that 0.1.x (Komorebi-Nine fork) lacked
+## 0.2.0 fixes that 0.1.x (an earlier private fork) lacked
 
 - pi prompt lifecycle: `data.disposition === 'handled'` no longer waits for a settle
   that never arrives.

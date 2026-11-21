@@ -17,7 +17,7 @@ The bundle replaces DSH's agent loop (`dsh-agent-loop`) with a headless `pi --mo
 Requirements: DSH `0.2.2-rc.1` or a compatible release, and `pi` on `PATH` (or an explicit `piPath`).
 
 ```sh
-dsh plugin --profile web add github:Komorebi-Nine/dsh-inline-pi-agent
+dsh plugin --profile web add github:simonzls123/dsh-inline-pi-agent
 ```
 
 The bundle layer disables `agent-loop`, DSH-side compaction and tool-result pruning, then inserts the `pi-agent` row. Restart `dsh web`, or rely on the profile's patch reload.
