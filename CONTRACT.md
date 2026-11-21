@@ -339,6 +339,8 @@ prepare(session with seed) → rebuild pi session file → spawn → 发布
 | `catalog` | `true` | 启动时探测 pi 并注册模型目录适配器；`false` 关闭 |
 | `requestHeader` | `true` | 每步记录 `request/header` + `request/context`（token 计量需要）；`false` 关闭 |
 | `piSessionDir` | `~/.dsh/pi-sessions` | 重建的 pi 会话快照目录 |
+| `maxSessions` | 0 | 同时存活的 pi 会话上限；0 表示不限 |
+| `idleReclaimMs` | 0 | 空闲回收阈值；0 表示不回收 |
 | `debug` | `false` | 协议与生命周期日志 |
 
 ### 9.0 profile 必需行
@@ -884,3 +886,55 @@ ctx.inject(['commands'], (commandCtx) => {
 ```
 
 它只改写 `request/header` 的 `model`，不影响发给 pi 的路由。代价：`request/header` 是原生 loop 续接时解析模型的依据，别名必须也是该部署里注册过的模型，否则切回原生 loop 那一侧会解析失败。
+
+## 16. 会话格式硬约束：advertised 与 recorded 必须逐字节一致（2026-11-21）
+
+### 16.1 现象
+
+加载历史时报：
+
+```
+SessionFormatError: tool/call call_xxx does not match one advertised tool call
+```
+
+整条会话被判定为 corrupt（`SESSION_QUERY_CORRUPT_SESSION`），打不开。
+
+### 16.2 规则
+
+DSH session-format v4（`dsh-session-format-v3-to-v4/src/relationships.ts` 的 `tool()`）在回读日志时要求：
+
+- `tool/call.data.arguments` 必须与上一条 `assistant/message` 中同 `callId` 的 `tool-call` 块的 `arguments` **严格字符串相等**；
+- 不相等直接抛 `SessionFormatError`，**没有修复分支**。
+
+### 16.3 曾经错在哪
+
+`dshFileToolArguments()` 只把 `file_path` / `old_string` / `new_string` 加到 `tool/call` 记录上，assistant 消息里仍是 pi 的原始参数（`path` / `edits`）。于是每一个 `write` / `edit` 调用都必然不一致，读到第一条就整条会话报废。
+
+同类错误还有：对两个来源的对象各做一次 `JSON.stringify`（键顺序不同也会不相等）。
+
+### 16.4 现在怎么保证
+
+- `agent.js` 的 `convertBlocks()`：assistant 块也经过 `dshFileToolArguments()`；
+- `#onToolStart()`：优先复用 assistant 消息里缓存的参数**字符串**（`advertisedToolArguments`），不再重新序列化；
+- `history.js` 的 `piToolArguments()`：回放 pi 会话时剥掉这些别名，pi 仍拿到自己的 schema。
+
+### 16.5 改代码后的自检
+
+```sh
+node scripts/session-format-guard.mjs
+# 或 npm run guard:session-format
+```
+
+必须输出 `OK`。不要只看别的测试通过：这个错误只在**下次加载历史**时暴露，写日志时不会报错。
+
+### 16.6 代码修好 ≠ 进程修好
+
+升级插件后必须重启 App / 3090 gateway。旧进程会把修好之前加载的代码继续用下去，按旧逻辑写坏新记录（2026-11-21 10:14 的两条坏记录就是这么来的）。也不要在 App 运行时替换 `~/.dsh/profiles/desktop` 里的插件。
+
+## 15. 附件投影（2026-11-21）
+
+- `image` 块 → `prompt` / `steer` 的 `images`（base64 ImageContent）。
+- `file` 块 → `ctx.get('llm').fileRequestText(ref)` 的句柄文字，拼在用户文本之前。
+  与原生 loop 的请求装配完全一致；不做投影时该块会被静默丢弃，模型会回答"没有附件"。
+- `history.js` 重建 pi 会话时用同一投影，resume 后引用不丢。
+- 拿不到可读路径时仍然描述该文件（文件名、字节数、sha256 短码），不静默丢弃。

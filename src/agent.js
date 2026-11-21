@@ -32,14 +32,19 @@ function convertBlocks(content) {
       case 'reasoning':
         blocks.push({ type: 'reasoning', text: typeof block.thinking === 'string' ? block.thinking : '' })
         break
-      case 'tool-call':
+      case 'tool-call': {
+        // The advertised block and the recorded tool/call must carry the exact
+        // same arguments string: session-format v4 rejects a tool/call that
+        // does not match its advertised call.
+        const name = String(block.name ?? '')
         blocks.push({
           type: 'tool-call',
           id: ToolCallId(String(block.id ?? '')),
-          name: String(block.name ?? ''),
-          arguments: JSON.stringify(block.arguments ?? {}),
+          name,
+          arguments: JSON.stringify(dshFileToolArguments(name, block.arguments ?? {})),
         })
         break
+      }
       default:
         break
     }
@@ -102,8 +107,10 @@ function resultText(result) {
 /**
  * Pi's file tools use `path` and `edits`; DSH's file card and deliverables read
  * `file_path`, `old_string` and `new_string`. Keep Pi's original fields and add
- * the DSH aliases to the recorded call only — assistant messages still rebuild
- * Pi's session from Pi's own schema.
+ * the DSH aliases. Both the advertised assistant block and the recorded
+ * tool/call must carry the identical string — session-format v4 rejects a
+ * tool/call that does not match its advertised call — and history.js strips
+ * the aliases again when it rebuilds Pi's own session.
  */
 function dshFileToolArguments(name, args) {
   if (args === null || typeof args !== 'object' || Array.isArray(args)) return args
@@ -162,6 +169,18 @@ function textOf(message) {
     .filter((block) => block.type === 'text')
     .map((block) => block.text)
     .join('\n')
+}
+
+/**
+ * Projection for a durable file reference when no handle text can be built.
+ * Mirrors dsh-llm's `fileHandleText` wording closely enough that a model told
+ * "no attachment" instead of "here is the saved path" is the only difference.
+ */
+function fileFallbackText(ref) {
+  const name = typeof ref?.name === 'string' ? ref.name : 'attachment'
+  const bytes = Number(ref?.bytes ?? 0)
+  const digest = typeof ref?.attachmentId === 'string' ? String(ref.attachmentId).slice(7, 15) : ''
+  return `[File "${name}" (${String(bytes)} bytes${digest === '' ? '' : `, sha256:${digest}`}): no readable path is available in this environment. Say so instead of claiming to have read it.]`
 }
 
 /** Whether two queued deltas belong to the same coalesced run. */
@@ -280,12 +299,18 @@ export class PiAgent {
     this.frameRevision = 0
     this.toolCallSeqs = new Map()
     this.toolCallArgs = new Map()
+    // Arguments exactly as advertised by the last assistant message, keyed by
+    // call id; tool/call reuses them verbatim so v4 relationship checks pass.
+    this.advertisedToolArguments = new Map()
     this.settleWaiters = []
     this.settled = false
     this.disposed = false
     this.rpcExited = null
     this.lastHeaderKey = undefined
     this.lastContextKey = undefined
+    // Idle reclamation reads this: a session with no work for `idleReclaimMs`
+    // is disposed (the durable log is complete, so the next open resumes it).
+    this.lastActivityAt = Date.now()
 
     this.unwatch = this.rpc.onEvent((event) => this.#onPiEvent(event))
     this.unwatchUi = this.rpc.onUiRequest((request) => this.#onUiRequest(request))
@@ -301,9 +326,28 @@ export class PiAgent {
     return this._status
   }
 
+  /** Whether durable work is still queued for this agent. */
+  get hasPending() {
+    return this.inbox.nextTurn.length > 0 || this.inbox.nextStep.length > 0
+  }
+
+  /**
+   * Whether the factory may dispose this agent to reclaim a slot.
+   * A running driver, queued input, an open step or a pending approval all keep
+   * the session alive: reclaiming it would drop work the durable log cannot
+   * replay by itself.
+   */
+  reclaimableAfter(now, idleMs) {
+    if (this.disposed || idleMs <= 0) return false
+    if (this._status !== 'idle' || this.driver !== null || this.hasPending) return false
+    if (this.stepOpen || this.turnOpen || this.attempt !== null) return false
+    return now - this.lastActivityAt >= idleMs
+  }
+
   // ---- Agent interface ----
 
   send(message, target, wakeup) {
+    this.lastActivityAt = Date.now()
     this.inbox.append(target, message)
     if (target === 'next-step' && this._status === 'running' && this.rpc.running) {
       void this.#deliverSteer(message)
@@ -352,27 +396,62 @@ export class PiAgent {
     })
   }
 
-  /** Resolve DSH image blocks into pi's base64 ImageContent. */
-  async #collectImages(messages) {
+  /**
+   * Resolve one message's attachment blocks for pi.
+   *
+   * Images travel as `ImageContent` because pi's `prompt` accepts them. Files do
+   * not: no provider receives file bytes, and DSH's own request assembly projects
+   * every file reference into handle text naming a read-only saved path (dsh-llm
+   * `fileRequestText`). Without that projection a `file` block vanishes and the
+   * model answers "there is no attachment" — the bug this method exists to fix.
+   * pi ships read/bash tools, so the saved path is all it needs.
+   */
+  async #collectAttachments(messages) {
     const attachments = this.ctx.get('attachments')
-    if (attachments === undefined) return []
+    const llm = this.ctx.get('llm')
     const images = []
+    const files = []
     for (const message of messages) {
       for (const block of Array.isArray(message?.content) ? message.content : []) {
-        if (block?.type !== 'image' || block.attachment === undefined) continue
-        try {
-          const stored = await attachments.readImage(block.attachment)
-          images.push({
-            type: 'image',
-            data: Buffer.from(stored.data).toString('base64'),
-            mimeType: stored.ref.mediaType,
-          })
-        } catch (error) {
-          this.logger?.(`[pi] image attachment failed: ${String(error)}`)
+        if (block === null || typeof block !== 'object') continue
+        if (block.type === 'image') {
+          if (attachments === undefined || block.attachment === undefined) continue
+          try {
+            const stored = await attachments.readImage(block.attachment)
+            images.push({
+              type: 'image',
+              data: Buffer.from(stored.data).toString('base64'),
+              mimeType: stored.ref.mediaType,
+            })
+          } catch (error) {
+            this.logger?.(`[pi] image attachment failed: ${String(error)}`)
+          }
+          continue
+        }
+        if (block.type === 'file') {
+          if (block.attachment === undefined) continue
+          let text
+          try {
+            // The llm service owns the same projection its own adapters use, so
+            // pi sees byte-for-byte what the native loop would have shown.
+            text = llm?.fileRequestText?.(block.attachment)
+          } catch (error) {
+            this.logger?.(`[pi] file handle text failed: ${String(error)}`)
+          }
+          files.push(typeof text === 'string' && text !== '' ? text : fileFallbackText(block.attachment))
         }
       }
     }
-    return images
+    return { images, files }
+  }
+
+  /** Compose the prompt pi receives: file handles first, then the user's text. */
+  #promptFor(messages, attachments) {
+    const text = messages.map((item) => textOf(item)).filter((part) => part !== '').join('\n')
+    const parts = [...attachments.files]
+    if (text !== '') parts.push(text)
+    else if (attachments.images.length > 0) parts.push('[image]')
+    return parts.join('\n\n')
   }
 
   /**
@@ -384,9 +463,8 @@ export class PiAgent {
   async #deliverSteer(message) {
     const turn = this.turn
     try {
-      const images = await this.#collectImages([message])
-      const text = textOf(message) || (images.length > 0 ? '[image]' : '')
-      await this.rpc.steer(text, images)
+      const attachments = await this.#collectAttachments([message])
+      await this.rpc.steer(this.#promptFor([message], attachments), attachments.images)
       if (this.turn !== turn || this._status !== 'running') return
       this.inbox.claimMessage(message.id, turn)
     } catch (error) {
@@ -422,6 +500,7 @@ export class PiAgent {
     this.step = 0
     this.toolCallSeqs.clear()
     this.toolCallArgs.clear()
+    this.advertisedToolArguments.clear()
     const turn = this.turn
 
     this.session.append('turn/start', { turn })
@@ -432,19 +511,26 @@ export class PiAgent {
     try {
       const steered = this.inbox.claimStep(turn)
       const messages = [message, ...steered]
-      const prompt = messages.map((item) => textOf(item)).filter((text) => text !== '').join('\n')
-      const images = await this.#collectImages(messages)
+      const attachments = await this.#collectAttachments(messages)
       await this.modelSync
       this.settled = false
-      const outcome = await this.rpc.prompt(prompt || (images.length > 0 ? '[image]' : ''), images)
+      const outcome = await this.rpc.prompt(this.#promptFor(messages, attachments), attachments.images)
       // `handled` means an extension command or input handler consumed the
       // prompt; pi starts no run and will never emit `agent_settled`.
       if (outcome?.disposition !== 'handled') await this.#waitSettled()
       if (this.rpcExited !== null) {
-        throw new Error(`pi process exited (code=${String(this.rpcExited.code)} signal=${String(this.rpcExited.signal)})`)
+        throw this.rpcExited.error ?? new Error(`pi process exited (code=${String(this.rpcExited.code)} signal=${String(this.rpcExited.signal)})`)
       }
     } catch (error) {
       failure = error
+      // The native loop publishes the failure at its live boundary before the
+      // driver contains it; the Web client, session telemetry and parent agents
+      // rely on this event, not on re-reading the durable log.
+      try {
+        this.dispatch.emit('agent/error', { turn, step: this.step, error })
+      } catch {
+        // reporting must never mask the original failure
+      }
     } finally {
       this.#closeStep()
       // A cancelled turn settles through `agent_settled` without rejecting, so
@@ -472,6 +558,7 @@ export class PiAgent {
   #setStatus(status) {
     if (this._status === status) return
     this._status = status
+    this.lastActivityAt = Date.now()
     this.dispatch.emit('agent/status', { status })
   }
 
@@ -790,6 +877,9 @@ export class PiAgent {
     const attempt = this.attempt
     this.attempt = null
     const blocks = convertBlocks(message.content)
+    for (const block of blocks) {
+      if (block.type === 'tool-call') this.advertisedToolArguments.set(String(block.id), block.arguments)
+    }
     const source = {
       provider: typeof message.provider === 'string' ? message.provider : (this.options.provider ?? ''),
       model: typeof message.model === 'string' ? message.model : (this.options.model ?? ''),
@@ -842,12 +932,16 @@ export class PiAgent {
     this.#openStep()
     const callId = ToolCallId(String(event.toolCallId ?? ''))
     const name = String(event.toolName ?? '')
+    // Reuse the advertised string verbatim when the assistant message carried
+    // this call; recomputing could differ in key order and break v4 replay.
+    const advertised = this.advertisedToolArguments.get(String(callId))
+    this.advertisedToolArguments.delete(String(callId))
     const callEvent = this.session.append('tool/call', {
       turn: this.turn,
       step: this.step,
       callId,
       name,
-      arguments: JSON.stringify(dshFileToolArguments(name, event.args ?? {})),
+      arguments: advertised ?? JSON.stringify(dshFileToolArguments(name, event.args ?? {})),
     })
     this.toolCallSeqs.set(String(callId), callEvent.seq)
     this.toolCallArgs.set(String(callId), event.args ?? {})

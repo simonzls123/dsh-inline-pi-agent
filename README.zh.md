@@ -42,6 +42,8 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `streamCatchUpFrames` | `6` | 完整积压应在多少拍内排空，用来决定追赶速率。 |
 | `streamMaxCharsPerFrame` | `64` | 单帧最多揭示的字符数。 |
 | `piSessionDir` | `~/.dsh/pi-sessions` | 重建的 pi 会话快照目录。 |
+| `maxSessions` | 0（不限） | 同时存活的 pi 会话上限。超出时先回收空闲会话，仍满则创建失败并说明原因。 |
+| `idleReclaimMs` | 0（不回收） | 空闲多久后释放该会话（含 pi 子进程）。会话日志完整，重新打开即 resume。 |
 | `dshTools` | 空 | 要把哪些 **DSH 工具** 通过 MCP 暴露给 pi（`mcp__dsh__<name>`）。留空则不启用；建议只列 pi 自己没有的工具，例如 Agent Team 那一套。 |
 | `piArgs` | 空 | 追加给 pi 子进程的参数，如 `['-e', 'C:/guard/permission.ts']`（审批网关扩展）。 |
 | `extensionUi` | `deny` | pi 扩展发起阻塞式对话框时如何应答：`deny` 一律 `cancelled`；`approval` 把 `confirm` 转成 DSH 的审批请求（会话策略决定是否弹窗）；`allow` 按“确认/首项/空串”放行（仅调试）。 |
@@ -155,3 +157,5 @@ node scripts/smoke.mjs resume
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
+
+附件说明：`image` 块以 `ImageContent` 下发给 pi；`file` 块（zip、文档等）按 `dsh-llm` 的 `fileRequestText` 投影成句柄文字（文件名、字节数、只读路径），pi 用自己的 read/bash 工具读该路径。

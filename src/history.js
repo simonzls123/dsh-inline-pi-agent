@@ -18,6 +18,32 @@ function textBlocks(blocks) {
   return blocks.filter((block) => block && block.type === 'text').map((block) => block.text)
 }
 
+/**
+ * Undo the DSH-only argument aliases agent.js adds for its file card; pi's
+ * file tools use `path`, `edits`, `oldText` and `newText`.
+ */
+function piToolArguments(name, args) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return args
+  if (name !== 'write' && name !== 'edit') return args
+  if (typeof args.path !== 'string' || args.path.trim() === '') return args
+  const {
+    file_path: _filePath, old_string: _oldString, new_string: _newString, ...piArgs
+  } = args
+  return piArgs
+}
+
+/**
+ * Projection for a durable file reference when no handle text can be built.
+ * Kept in step with agent.js: a resumed session must describe the attachment
+ * the same way the live turn did.
+ */
+function fileFallbackText(ref) {
+  const name = typeof ref?.name === 'string' ? ref.name : 'attachment'
+  const bytes = Number(ref?.bytes ?? 0)
+  const digest = typeof ref?.attachmentId === 'string' ? String(ref.attachmentId).slice(7, 15) : ''
+  return `[File "${name}" (${String(bytes)} bytes${digest === '' ? '' : `, sha256:${digest}`}): no readable path is available in this environment. Say so instead of claiming to have read it.]`
+}
+
 /** Convert DSH content blocks into pi blocks; images are handled by imageBlocks(). */
 function convertBlocks(blocks, logger) {
   const out = []
@@ -40,7 +66,7 @@ function convertBlocks(blocks, logger) {
             args = { raw: block.arguments }
           }
         }
-        out.push({ type: 'toolCall', id: String(block.id), name: block.name, arguments: args })
+        out.push({ type: 'toolCall', id: String(block.id), name: block.name, arguments: piToolArguments(String(block.name ?? ''), args) })
         break
       }
       case 'image':
@@ -95,10 +121,24 @@ async function imageBlocks(blocks, attachments, logger) {
   return out
 }
 
-async function toPiUserMessage(message, attachments, logger) {
+async function toPiUserMessage(message, attachments, fileText, logger) {
   const blocks = convertBlocks(message.content, logger)
   const images = await imageBlocks(message.content, attachments, logger)
-  const text = textBlocks(blocks).join('\n')
+  // A file reference is projected to handle text here exactly as it is on the
+  // live path: no provider receives file bytes, and dropping the block would
+  // make a resumed pi session answer "there is no attachment".
+  const handles = []
+  for (const block of message.content ?? []) {
+    if (block?.type !== 'file' || block.attachment === undefined) continue
+    let text
+    try {
+      text = fileText?.(block.attachment)
+    } catch (error) {
+      logger?.(`[history] file handle text failed: ${String(error)}`)
+    }
+    handles.push(typeof text === 'string' && text !== '' ? text : fileFallbackText(block.attachment))
+  }
+  const text = [...handles, textBlocks(blocks).join('\n')].filter((part) => part !== '').join('\n\n')
   if (images.length === 0) return { role: 'user', content: text === '' ? blocks : text }
   return {
     role: 'user',
@@ -152,7 +192,7 @@ function entryId(seq) {
  * Write the pi session file for one DSH session.
  * @returns the written path.
  */
-export async function buildPiSessionFile({ session, cwd, filePath, logger, attachments }) {
+export async function buildPiSessionFile({ session, cwd, filePath, logger, attachments, fileText }) {
   const toolNames = new Map()
   const finishReasons = new Map()
   const entries = []
@@ -174,7 +214,7 @@ export async function buildPiSessionFile({ session, cwd, filePath, logger, attac
         toolNames.set(String(event.data.callId), event.data.name)
         continue
       case 'user/message':
-        message = await toPiUserMessage(event.data, attachments, logger)
+        message = await toPiUserMessage(event.data, attachments, fileText, logger)
         break
       case 'assistant/message':
         message = toPiAssistantMessage(event.data, finishReasons, logger)

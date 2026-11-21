@@ -42,6 +42,8 @@ dsh plugin --profile web add link:/absolute/path/to/dsh-inline-pi-agent
 | `streamCatchUpFrames` | `6` | How many ticks a full backlog should take to drain, which sets the reveal rate while text is arriving faster than it is shown. |
 | `streamMaxCharsPerFrame` | `64` | Upper bound on characters revealed by one frame. |
 | `piSessionDir` | `~/.dsh/pi-sessions` | Where rebuilt pi session snapshots are written. |
+| `maxSessions` | `0` (unlimited) | Live pi sessions per profile. At the limit, idle sessions are reclaimed first; if none can go, creation fails with the reason. |
+| `idleReclaimMs` | `0` (never) | Release a session (and its pi child) after this much idle time. The durable log is complete, so reopening it resumes. |
 | `dshTools` | none | DSH tool names to expose to pi over MCP as `mcp__dsh__<name>`. Empty disables the bridge. List only tools pi does not ship itself. |
 | `piArgs` | none | Extra pi child arguments, e.g. `['-e', 'C:/guard/permission.ts']` for an approval gate extension. |
 | `extensionUi` | `deny` | How blocking extension dialogs are answered: `deny` replies `cancelled`; `approval` routes `confirm` through DSH's approval seam; `allow` approves the first option (debugging only). |
@@ -130,3 +132,5 @@ node scripts/smoke.mjs resume
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Attachments: `image` blocks travel to pi as `ImageContent`; `file` blocks (zips, documents) are projected through `dsh-llm`'s `fileRequestText` into handle text naming the read-only saved path, which pi opens with its own read/bash tools.

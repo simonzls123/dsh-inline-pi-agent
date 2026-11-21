@@ -102,6 +102,8 @@ export async function apply(ctx, config = {}) {
     ...(config.piSessionDir === undefined ? {} : { piSessionDir: config.piSessionDir }),
     requestHeader: config.requestHeader !== false,
     presentFiles: config.presentFiles !== false,
+    ...(positive(config.maxSessions) ? { maxSessions: Math.floor(config.maxSessions) } : {}),
+    ...(positive(config.idleReclaimMs) ? { idleReclaimMs: Math.round(config.idleReclaimMs) } : {}),
     modelInfo: (provider, model) => catalog.lookup?.(provider, model),
     ...(config.extensionUi === undefined ? {} : { extensionUi: config.extensionUi }),
     ...(config.toolProgress === undefined ? {} : { toolProgress: config.toolProgress }),

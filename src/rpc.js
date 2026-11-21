@@ -28,6 +28,10 @@ function resolveSpawn(piPath, args) {
   return { file: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c', line] }
 }
 
+/** How much of pi's stderr to keep for diagnostics (it carries auth/provider errors). */
+const STDERR_TAIL_LINES = 40
+const STDERR_TAIL_CHARS = 8192
+
 export class PiRpcClient {
   constructor({ piPath = 'pi', cwd, sessionFile, logger, extraArgs, extraEnv }) {
     this.cwd = cwd
@@ -37,6 +41,17 @@ export class PiRpcClient {
     this.buffer = ''
     this.pending = new Map()
     this.events = new EventEmitter()
+    // The terminal failure, once the child is unusable. Every later command
+    // rejects with it instead of a transport-level symptom (EPIPE, destroyed
+    // stream), which is what the user would otherwise see in the transcript.
+    this.failure = undefined
+    this.emittedExit = false
+    this.stderrTail = []
+    // Resolves when the child becomes usable or permanently dead, so a failed
+    // write can wait for the lifecycle verdict instead of reporting EPIPE.
+    this.death = new Promise((resolve) => {
+      this.deathResolve = resolve
+    })
     // Extension UI requests are a separate subprotocol: they carry their own id
     // namespace and expect `extension_ui_response` on stdin (docs/rpc-extension-ui.md).
     this.ui = new EventEmitter()
@@ -58,16 +73,69 @@ export class PiRpcClient {
     this.proc.stdout.setEncoding('utf8')
     this.proc.stdout.on('data', (chunk) => this.#onData(chunk))
     this.proc.stderr.setEncoding('utf8')
-    this.proc.stderr.on('data', (chunk) => this.logger?.(`[pi:stderr] ${chunk.trimEnd()}`))
-    this.proc.on('error', (error) => this.logger?.(`[pi:error] ${String(error)}`))
+    this.proc.stderr.on('data', (chunk) => {
+      this.#captureStderr(chunk)
+      this.logger?.(`[pi:stderr] ${chunk.trimEnd()}`)
+    })
+    // Writing to a dead child raises EPIPE on stdin; without a listener that
+    // becomes an uncaught 'error' event and takes the host process down.
+    this.proc.stdin.on('error', (error) => this.logger?.(`[pi:stdin] ${String(error)}`))
+    // A spawn failure (ENOENT, EACCES for a non-executable piPath) emits `error`
+    // and never `exit`: settle every pending command here, or the turn hangs.
+    this.proc.on('error', (error) => {
+      this.logger?.(`[pi:error] ${String(error)}`)
+      this.#fail(this.#diagnose(`cannot start pi (${JSON.stringify(String(piPath))}): ${error.message}`))
+    })
     this.proc.on('exit', (code, signal) => {
       this.closed = true
       this.logger?.(`[pi:exit] code=${String(code)} signal=${String(signal)}`)
-      const failure = new Error(`pi exited (code=${String(code)} signal=${String(signal)})`)
-      for (const entry of this.pending.values()) entry.reject(failure)
-      this.pending.clear()
-      this.events.emit('exit', { code, signal })
+      this.#fail(
+        this.#diagnose(`pi exited (code=${String(code)} signal=${String(signal)})`),
+        { code, signal },
+      )
     })
+  }
+
+  /** Keep the tail of stderr so a failure can quote what pi actually said. */
+  #captureStderr(chunk) {
+    for (const line of String(chunk).split('\n')) {
+      if (line.trim() === '') continue
+      this.stderrTail.push(line.trimEnd())
+    }
+    if (this.stderrTail.length > STDERR_TAIL_LINES) {
+      this.stderrTail.splice(0, this.stderrTail.length - STDERR_TAIL_LINES)
+    }
+    let total = 0
+    for (const line of this.stderrTail) total += line.length + 1
+    while (total > STDERR_TAIL_CHARS && this.stderrTail.length > 1) {
+      total -= this.stderrTail[0].length + 1
+      this.stderrTail.shift()
+    }
+  }
+
+  /** Attach pi's own words to a lifecycle failure. */
+  #diagnose(base) {
+    const tail = this.stderrTail.join('\n').trim()
+    return new Error(tail === '' ? base : `${base}\n--- pi stderr ---\n${tail}`)
+  }
+
+  /**
+   * Publish the terminal state once, and reject every waiter with the first
+   * failure. Later transport errors (the exit that follows a spawn error, an
+   * EPIPE after the child died) must not replace the actionable message.
+   */
+  #fail(error, info = { code: null, signal: null }) {
+    const first = this.failure === undefined
+    this.failure ??= error
+    this.closed = true
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const entry of pending) entry.reject(this.failure)
+    if (first) {
+      this.emittedExit = true
+      this.events.emit('exit', { ...info, error: this.failure })
+    }
+    this.deathResolve()
   }
 
   get running() {
@@ -119,15 +187,27 @@ export class PiRpcClient {
 
   /** Send one command and resolve with its correlated response envelope. */
   send(command) {
-    if (this.closed) return Promise.reject(new Error('pi process is not running'))
+    if (this.closed || this.failure !== undefined) {
+      return Promise.reject(this.failure ?? new Error('pi process is not running'))
+    }
     const id = command.id ?? `cmd-${++this.nextId}`
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
       this.proc.stdin.write(`${JSON.stringify({ ...command, id })}\n`, (error) => {
-        if (error) {
-          this.pending.delete(id)
-          reject(error)
+        if (error === null || error === undefined) return
+        // A write error means the pipe is gone, not why the child is gone. The
+        // exit or spawn error carries the actionable cause and arrives within
+        // the same event-loop turn on some platforms, a beat later on others,
+        // so give it a short window before falling back to the transport error.
+        const settle = () => {
+          if (this.pending.delete(id)) reject(this.failure ?? error)
         }
+        const timer = setTimeout(settle, 250)
+        timer.unref?.()
+        void this.death.then(() => {
+          clearTimeout(timer)
+          settle()
+        })
       })
     })
   }

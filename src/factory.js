@@ -35,16 +35,73 @@ export class PiAgentFactory {
   constructor(registryCtx, options) {
     this.registryCtx = registryCtx
     this.options = options
-    this.live = new Set()
+    // owned dispose() → { agent, dispose }. A Map (not a Set) because idle
+    // reclamation needs the agent's activity to decide what may be released.
+    this.live = new Map()
+    this.maxSessions = Number.isSafeInteger(options.maxSessions) && options.maxSessions > 0 ? options.maxSessions : 0
+    this.idleReclaimMs = Number.isFinite(options.idleReclaimMs) && options.idleReclaimMs > 0 ? options.idleReclaimMs : 0
+    this.reclaimTimer = null
     this.piSessionDirectory = options.piSessionDir ?? join(homedir(), '.dsh', 'pi-sessions')
     mkdirSync(this.piSessionDirectory, { recursive: true })
+    this.#startReclaimer()
   }
 
   /** Stop every agent this factory published (plugin unload). */
   disposeAll() {
-    const disposers = [...this.live]
+    if (this.reclaimTimer !== null) {
+      clearInterval(this.reclaimTimer)
+      this.reclaimTimer = null
+    }
+    const disposers = [...this.live.values()].map((record) => record.dispose)
     this.live.clear()
     return Promise.allSettled(disposers.map((dispose) => dispose()))
+  }
+
+  /**
+   * Release sessions that have been idle long enough. Every pi child holds a
+   * whole agent runtime (~160MB), so an abandoned browser tab would otherwise
+   * pin memory until the process restarts. The durable log stays complete, so
+   * reopening the session resumes it.
+   */
+  #startReclaimer() {
+    if (!(this.idleReclaimMs > 0)) return
+    const interval = Math.max(1000, Math.min(60000, Math.floor(this.idleReclaimMs / 4)))
+    this.reclaimTimer = setInterval(() => {
+      void this.#reclaimIdle()
+    }, interval)
+    this.reclaimTimer.unref?.()
+  }
+
+  /** Dispose idle agents; returns how many were released. */
+  async #reclaimIdle(now = Date.now()) {
+    const victims = []
+    for (const [owned, record] of this.live) {
+      if (record.agent.reclaimableAfter(now, this.idleReclaimMs)) victims.push([owned, record])
+    }
+    for (const [owned, record] of victims) {
+      this.live.delete(owned)
+      const idleSeconds = Math.round((now - record.agent.lastActivityAt) / 1000)
+      this.options.logger?.(`[pi] reclaiming idle session ${String(record.agent.id)} after ${String(idleSeconds)}s; reopening it resumes from the durable log`)
+      await record.dispose().catch((error) => {
+        this.options.logger?.(`[pi] reclaim failed for ${String(record.agent.id)}: ${String(error)}`)
+      })
+    }
+    return victims.length
+  }
+
+  /**
+   * Hold a session slot, or refuse with an actionable message. Reclaiming first
+   * means a burst of new sessions can take over stale ones instead of failing.
+   */
+  async #reserveSlot() {
+    const max = this.maxSessions
+    if (!(max > 0) || this.live.size < max) return
+    if (this.idleReclaimMs > 0) await this.#reclaimIdle()
+    if (this.live.size < max) return
+    throw new Error(
+      `pi-agent: ${String(this.live.size)} sessions are already running (maxSessions=${String(max)}). `
+      + 'Close an idle session and retry, or raise maxSessions for this profile.',
+    )
   }
 
   #sessionFile(id) {
@@ -84,6 +141,9 @@ export class PiAgentFactory {
       filePath: this.#sessionFile(session.id),
       logger: this.options.logger,
       attachments: this.registryCtx.get('attachments'),
+      // Same projection the live turn uses, so a resumed session describes the
+      // attachment identically instead of silently losing it.
+      fileText: (ref) => this.registryCtx.get('llm')?.fileRequestText?.(ref),
     })
 
     // Reserve the bridge token before spawning: the child needs it in its env,
@@ -172,7 +232,14 @@ export class PiAgentFactory {
       await this.registryCtx.agents.announce(agent, source, signal)
       emitAgentEvent(this.registryCtx, agent, 'agent/session-start', { source })
       const owned = () => dispose().then(() => undefined)
-      this.live.add(owned)
+      const record = {
+        agent,
+        dispose: () => {
+          this.live.delete(owned)
+          return owned()
+        },
+      }
+      this.live.set(owned, record)
       return {
         agent,
         dispose: () => {
@@ -188,6 +255,7 @@ export class PiAgentFactory {
   }
 
   async createAgent(ownerCtx, options) {
+    await this.#reserveSlot()
     const session = this.registryCtx.sessions.prepare(options.sessionId, {
       ...(options.meta === undefined ? {} : { meta: options.meta }),
       ...(options.seed === undefined ? {} : { seed: options.seed }),
@@ -215,6 +283,7 @@ export class PiAgentFactory {
     if (persistence === undefined) {
       throw new Error('cannot resume: session persistence is not configured (load a dsh-session-persistence backend)')
     }
+    await this.#reserveSlot()
     const id = options.resumeSessionId
     const handle = await persistence.open(id, 'write', {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
