@@ -18,7 +18,7 @@ function textBlocks(blocks) {
   return blocks.filter((block) => block && block.type === 'text').map((block) => block.text)
 }
 
-/** Convert DSH content blocks into pi blocks; image and unknown kinds are dropped. */
+/** Convert DSH content blocks into pi blocks; images are handled by imageBlocks(). */
 function convertBlocks(blocks, logger) {
   const out = []
   for (const block of blocks ?? []) {
@@ -44,7 +44,7 @@ function convertBlocks(blocks, logger) {
         break
       }
       case 'image':
-        logger?.(`[history] skipping image block (attachment refs are runtime-only)`)
+        // Resolved separately by imageBlocks() for user messages.
         break
       default:
         break
@@ -67,10 +67,43 @@ function mapStopReason(reason, hasToolCalls) {
   }
 }
 
-function toPiUserMessage(message, logger) {
+/**
+ * Resolve DSH image blocks into pi ImageContent. The attachment store is
+ * async, so the session rebuild awaits it when the service is mounted.
+ */
+async function imageBlocks(blocks, attachments, logger) {
+  if (attachments === undefined) {
+    if ((blocks ?? []).some((block) => block?.type === 'image')) {
+      logger?.('[history] skipping image block: no attachment service')
+    }
+    return []
+  }
+  const out = []
+  for (const block of blocks ?? []) {
+    if (block?.type !== 'image' || block.attachment === undefined) continue
+    try {
+      const stored = await attachments.readImage(block.attachment)
+      out.push({
+        type: 'image',
+        data: Buffer.from(stored.data).toString('base64'),
+        mimeType: stored.ref.mediaType,
+      })
+    } catch (error) {
+      logger?.(`[history] image attachment failed: ${String(error)}`)
+    }
+  }
+  return out
+}
+
+async function toPiUserMessage(message, attachments, logger) {
   const blocks = convertBlocks(message.content, logger)
+  const images = await imageBlocks(message.content, attachments, logger)
   const text = textBlocks(blocks).join('\n')
-  return { role: 'user', content: text === '' ? blocks : text }
+  if (images.length === 0) return { role: 'user', content: text === '' ? blocks : text }
+  return {
+    role: 'user',
+    content: text === '' ? [...blocks, ...images] : [{ type: 'text', text }, ...images],
+  }
 }
 
 /** DSH TokenUsage → pi usage block (pi requires `input`/`output` on every assistant message). */
@@ -119,7 +152,7 @@ function entryId(seq) {
  * Write the pi session file for one DSH session.
  * @returns the written path.
  */
-export function buildPiSessionFile({ session, cwd, filePath, logger }) {
+export async function buildPiSessionFile({ session, cwd, filePath, logger, attachments }) {
   const toolNames = new Map()
   const finishReasons = new Map()
   const entries = []
@@ -141,7 +174,7 @@ export function buildPiSessionFile({ session, cwd, filePath, logger }) {
         toolNames.set(String(event.data.callId), event.data.name)
         continue
       case 'user/message':
-        message = toPiUserMessage(event.data, logger)
+        message = await toPiUserMessage(event.data, attachments, logger)
         break
       case 'assistant/message':
         message = toPiAssistantMessage(event.data, finishReasons, logger)

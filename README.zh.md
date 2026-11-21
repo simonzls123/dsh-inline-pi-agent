@@ -112,6 +112,13 @@ pi 执行自己的工具，DSH 的审批策略原本看不到它们。开启下�
 
 > 注意：`guard` 只覆盖 pi **自己的**工具。经 `dshTools` 桥过来的 DSH 工具本来就受 DSH 策略管，不需要重复拦截。
 
+## 运行行为
+
+- 用户消息里的图片会从 DSH 的 attachment 服务读出，作为 pi `prompt`/`steer` 的 `images` 下发；挂载 attachment 服务时，resume 重建 pi 会话也会把历史图片重新写回 user message。
+- pi 对扩展命令/输入处理器返回 `disposition: "handled"` 时不启动 run；插件直接把该 turn 记为完成，不再等待 `agent_settled`。
+- resume 时会话持久化的 `model/selection` 优先于部署默认模型；每次 prompt 前会等待 `set_model` + `set_thinking_level` 完成。
+- 运行中到达的 `next-step`/inject 消息通过 pi 的 `steer` 下发；错过当前 turn 的消息留在队列，下一轮再发。
+
 ## 已知限制
 
 - **pi 自己的工具**只有配了 `guard` 才受 DSH 审批约束；未配置时（默认）它们仍由 pi 直接执行。

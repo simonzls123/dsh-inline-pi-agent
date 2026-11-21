@@ -229,7 +229,8 @@ export class PiAgent {
     this.ctx = this.scope.ctx.extend({ agent: this })
     this.dispatch = agentEvents(ctx, this)
     this.inbox = new PiInbox({ session, dispatch: this.dispatch })
-    this.model = new PiModel(session, this.options, (selection) => this.#applyModel(selection))
+    this.modelSync = Promise.resolve()
+    this.model = new PiModel(session, this.options, (selection) => this.syncModel(selection))
 
     this.driver = null
     // Resumed sessions continue the durable turn numbering.
@@ -253,6 +254,7 @@ export class PiAgent {
     this.toolCallSeqs = new Map()
     this.toolCallArgs = new Map()
     this.settleWaiters = []
+    this.settled = false
     this.disposed = false
     this.rpcExited = null
     this.lastHeaderKey = undefined
@@ -276,30 +278,23 @@ export class PiAgent {
 
   send(message, target, wakeup) {
     this.inbox.append(target, message)
+    if (target === 'next-step' && this._status === 'running' && this.rpc.running) {
+      void this.#deliverSteer(message)
+      return
+    }
     if (wakeup) this.#wake()
   }
 
   followup(message) {
-    this.inbox.append('next-turn', message)
-    this.#wake()
+    this.send(message, 'next-turn', true)
   }
 
   steer(message) {
-    this.inbox.append('next-step', message)
-    if (this._status === 'running' && this.rpc.running) {
-      // pi owns the mid-run delivery: claim once it accepts, so the inbox does
-      // not keep a steer that already reached the engine.
-      void this.rpc
-        .steer(textOf(message))
-        .then(() => this.inbox.claimMessage(message.id, this.turn))
-        .catch(() => undefined)
-    } else {
-      this.#wake()
-    }
+    this.send(message, 'next-step', true)
   }
 
   inject(message) {
-    this.inbox.append('next-step', message)
+    this.send(message, 'next-step', false)
   }
 
   cancel(cause, options) {
@@ -330,14 +325,65 @@ export class PiAgent {
     })
   }
 
+  /** Resolve DSH image blocks into pi's base64 ImageContent. */
+  async #collectImages(messages) {
+    const attachments = this.ctx.get('attachments')
+    if (attachments === undefined) return []
+    const images = []
+    for (const message of messages) {
+      for (const block of Array.isArray(message?.content) ? message.content : []) {
+        if (block?.type !== 'image' || block.attachment === undefined) continue
+        try {
+          const stored = await attachments.readImage(block.attachment)
+          images.push({
+            type: 'image',
+            data: Buffer.from(stored.data).toString('base64'),
+            mimeType: stored.ref.mediaType,
+          })
+        } catch (error) {
+          this.logger?.(`[pi] image attachment failed: ${String(error)}`)
+        }
+      }
+    }
+    return images
+  }
+
+  /**
+   * Deliver one next-step message to the running pi child. A steer accepted by
+   * pi is removed only while its turn is still current; if the turn ended
+   * first the message stays queued for the next turn instead of being claimed
+   * for a turn that can no longer carry it.
+   */
+  async #deliverSteer(message) {
+    const turn = this.turn
+    try {
+      const images = await this.#collectImages([message])
+      const text = textOf(message) || (images.length > 0 ? '[image]' : '')
+      await this.rpc.steer(text, images)
+      if (this.turn !== turn || this._status !== 'running') return
+      this.inbox.claimMessage(message.id, turn)
+    } catch (error) {
+      this.logger?.(`[pi] steer failed: ${String(error)}`)
+    }
+  }
+
   async #drive() {
     this.#setStatus('running')
     try {
       for (;;) {
+        if (this.aborted) break
         const next = this.inbox.nextTurn[0]
-        if (next === undefined || this.aborted) break
-        this.inbox.claimTurn(this.turn + 1)
-        await this.#runTurn(next)
+        if (next !== undefined) {
+          this.inbox.claimTurn(this.turn + 1)
+          await this.#runTurn(next)
+          continue
+        }
+        // A steer can arrive while idle; it is still a queued step, not a
+        // cancelled message. Start a turn from it so it is not stranded.
+        const steered = this.inbox.nextStep[0]
+        if (steered === undefined) break
+        this.inbox.claimMessage(steered.id, this.turn + 1)
+        await this.#runTurn(steered)
       }
     } finally {
       this.aborted = false
@@ -348,6 +394,7 @@ export class PiAgent {
     this.turn += 1
     this.step = 0
     this.toolCallSeqs.clear()
+    this.toolCallArgs.clear()
     const turn = this.turn
 
     this.session.append('turn/start', { turn })
@@ -356,10 +403,16 @@ export class PiAgent {
 
     let failure
     try {
-      const steered = this.inbox.claimStep(turn).map((item) => textOf(item))
-      const prompt = [textOf(message), ...steered].filter((text) => text !== '').join('\n')
-      await this.rpc.prompt(prompt)
-      await this.#waitSettled()
+      const steered = this.inbox.claimStep(turn)
+      const messages = [message, ...steered]
+      const prompt = messages.map((item) => textOf(item)).filter((text) => text !== '').join('\n')
+      const images = await this.#collectImages(messages)
+      await this.modelSync
+      this.settled = false
+      const outcome = await this.rpc.prompt(prompt || (images.length > 0 ? '[image]' : ''), images)
+      // `handled` means an extension command or input handler consumed the
+      // prompt; pi starts no run and will never emit `agent_settled`.
+      if (outcome?.disposition !== 'handled') await this.#waitSettled()
       if (this.rpcExited !== null) {
         throw new Error(`pi process exited (code=${String(this.rpcExited.code)} signal=${String(this.rpcExited.signal)})`)
       }
@@ -380,6 +433,10 @@ export class PiAgent {
   }
 
   #waitSettled() {
+    if (this.settled) {
+      this.settled = false
+      return Promise.resolve()
+    }
     return new Promise((resolve) => {
       this.settleWaiters.push(resolve)
     })
@@ -499,6 +556,7 @@ export class PiAgent {
         this.logger?.(`[pi] thinking level now ${String(this.thinkingLevel)}`)
         return
       case 'agent_settled': {
+        this.settled = true
         const waiters = this.settleWaiters.splice(0)
         for (const resolve of waiters) resolve()
         return
@@ -950,30 +1008,31 @@ export class PiAgent {
     this.lastCompaction = { ok: true, ...recorded, reason: pending?.reason }
   }
 
-  /** Push a selected route to pi, honouring the configured route mapping. */
-  #applyModel(selection) {
+  /** Queue a selected route; the next prompt waits for this promise. */
+  syncModel(selection) {
+    if (selection?.provider === undefined || selection?.model === undefined) return this.modelSync
     const key = `${selection.provider}/${selection.model}`
     const route = this.modelMap?.[key] ?? key
     const separator = route.indexOf('/')
     if (separator === -1) {
       this.logger?.(`[pi] model "${key}" has no provider/model mapping; left pi's model unchanged`)
-      return
+      return this.modelSync
     }
-    void this.rpc
-      .setModel(route.slice(0, separator), route.slice(separator + 1))
-      .catch((error) => this.logger?.(`[pi] set_model failed for ${key}: ${String(error)}`))
-    if (typeof selection.reasoningEffort === 'string' && selection.reasoningEffort !== '') {
-      // Levels are model-scoped, so they follow set_model. pi clamps the request
-      // to the model's capabilities (medium may land on high); log the result.
-      void this.rpc
-        .setThinkingLevel(selection.reasoningEffort)
-        .then((applied) => {
-          if (applied !== undefined && applied !== selection.reasoningEffort) {
-            this.logger?.(`[pi] thinking level ${selection.reasoningEffort} clamped to ${applied}`)
-          }
-        })
-        .catch((error) => this.logger?.(`[pi] set_thinking_level failed for ${key}: ${String(error)}`))
-    }
+    const provider = route.slice(0, separator)
+    const modelId = route.slice(separator + 1)
+    const level = selection.reasoningEffort
+    this.modelSync = this.modelSync.then(async () => {
+      await this.rpc.setModel(provider, modelId)
+      if (typeof level === 'string' && level !== '') {
+        const applied = await this.rpc.setThinkingLevel(level)
+        if (applied !== undefined && applied !== level) {
+          this.logger?.(`[pi] thinking level ${level} clamped to ${applied}`)
+        }
+      }
+    }).catch((error) => {
+      this.logger?.(`[pi] model sync failed for ${key}: ${String(error)}`)
+    })
+    return this.modelSync
   }
 
   /** Stop the driver and the pi child, then unwind the scoped context. */
@@ -999,6 +1058,13 @@ class PiModel {
     this.options = options
     this.onSelect = onSelect
     this.selected = undefined
+    // Resume must keep the model the session chose, not the deployment default
+    // supplied in `options`.
+    for (const event of session.snapshotEvents()) {
+      if (event.type === 'model/selection' && event.data !== null && typeof event.data === 'object') {
+        this.selected = { ...event.data }
+      }
+    }
   }
 
   current() {

@@ -88,6 +88,13 @@ Two boundaries:
 - **Only bridged tools obey DSH policy.** pi's own bash/read/write still execute inside pi, so the sandbox and approval presets do not apply to them.
 - **DSH's team guidance text does not reach pi** (pi uses its own system prompt). The task-board tools work, but the "how to use the board" section is missing; add it to your prompt if the model needs it.
 
+## Runtime behavior
+
+- Images in user messages are read from DSH's attachment service and sent to pi as `prompt`/`steer` images; resume also rebuilds prior images into the pi user messages when the attachment service is mounted.
+- A prompt that pi reports as `disposition: "handled"` (extension command or input handler) starts no run. The plugin closes the turn as completed instead of waiting for `agent_settled`.
+- A session's persisted `model/selection` wins over the deployment default on resume, and every prompt waits for `set_model` + `set_thinking_level` to settle.
+- `next-step`/injected messages arriving during a run are delivered through pi's `steer`; messages that miss the turn stay queued and start the next turn.
+
 ## Known limitations
 
 - pi executes its own tools, so DSH sandboxing, approval flow and permission presets do not apply to them. To actually gate them, load a pi extension that hooks `tool_call` and calls `ctx.ui.confirm()`, then bridge the dialog — the plugin answers it (default `extensionUi: 'deny'`).

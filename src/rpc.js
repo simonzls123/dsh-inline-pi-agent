@@ -132,15 +132,24 @@ export class PiRpcClient {
     })
   }
 
-  async prompt(message) {
-    const response = await this.send({ type: 'prompt', message })
+  async prompt(message, images) {
+    const response = await this.send({
+      type: 'prompt',
+      message,
+      ...(Array.isArray(images) && images.length > 0 ? { images } : {}),
+    })
     if (!response.success) throw new Error(`pi prompt failed: ${response.error ?? 'unknown'}`)
     return response.data
   }
 
-  async steer(message) {
-    const response = await this.send({ type: 'steer', message })
+  async steer(message, images) {
+    const response = await this.send({
+      type: 'steer',
+      message,
+      ...(Array.isArray(images) && images.length > 0 ? { images } : {}),
+    })
     if (!response.success) throw new Error(`pi steer failed: ${response.error ?? 'unknown'}`)
+    return response.data
   }
 
   async abort() {

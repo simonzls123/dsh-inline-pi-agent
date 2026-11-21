@@ -10,9 +10,11 @@
  */
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { Context, Service } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
+import LocalAttachmentStore from '@deepseek-ai/dsh-attachment-local'
 import LlmRuntime, { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore from '@deepseek-ai/dsh-session'
 import * as JsonlPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
@@ -24,6 +26,7 @@ import ToolsService from '@deepseek-ai/dsh-tools'
 import * as NativeExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 import * as piAgentPlugin from '../src/index.js'
+import { buildPiSessionFile } from '../src/history.js'
 
 let failed = false
 const check = (label, condition, detail) => {
@@ -67,6 +70,7 @@ ctx.plugin(SystemPrompt)
 ctx.plugin(ToolsService)
 ctx.plugin(NativeExecutor)
 ctx.plugin(StubApproval)
+ctx.plugin(LocalAttachmentStore, { dshHome: join(root, 'home') })
 
 let boardCalls = 0
 ctx.inject(['tools'], (toolCtx) => {
@@ -86,6 +90,7 @@ ctx.inject(['tools'], (toolCtx) => {
 ctx.plugin(piAgentPlugin, {
   piPath: process.env.PI_PATH ?? 'pi',
   cwd: root,
+  piArgs: ['-e', fileURLToPath(new URL('./fixtures/handled-input.mjs', import.meta.url))],
   dshTools: ['board_create'],
   extensionUi: 'approval',
   guard: ['bash'],
@@ -191,6 +196,85 @@ check(
   ['mcp__dsh__board_create', 'bash', 'write'].every((name) => allCallNames.includes(name)),
   JSON.stringify(allCallNames),
 )
+
+// 6. A handled prompt (extension command/input handler) starts no run and
+// must close its turn instead of waiting forever for agent_settled.
+const turnsBeforeHandled = agent.session.ownEvents().filter((event) => event.type === 'turn/start').length
+await ask('HANDLED_TEST')
+const handledEvents = agent.session.ownEvents()
+const turnsAfterHandled = handledEvents.filter((event) => event.type === 'turn/start').length
+const handledEnd = handledEvents.filter((event) => event.type === 'turn/end').at(-1)
+check(
+  'handled prompt closes its turn without a run',
+  turnsAfterHandled === turnsBeforeHandled + 1 && handledEnd?.data?.reason?.kind === 'completed',
+  `turns=${turnsBeforeHandled}->${turnsAfterHandled} reason=${JSON.stringify(handledEnd?.data?.reason)}`,
+)
+await ask('Reply with exactly: AFTER_HANDLED')
+const afterHandled = agent.session.ownEvents().filter((event) => event.type === 'assistant/message').at(-1)
+const afterHandledText = afterHandled?.data?.message?.content
+  ?.filter((block) => block.type === 'text').map((block) => block.text).join(' ') ?? ''
+check('the agent still runs after a handled prompt', afterHandledText.includes('AFTER_HANDLED'), afterHandledText)
+
+// 7. Images from DSH attachments are resolved and sent to pi.
+await waitFor('attachments')
+const png = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64',
+)
+const image = await ctx.attachments.saveImage({ data: png, mediaType: 'image/png', name: 'dot.png' })
+agent.followup(createUserMessage({
+  content: [{ type: 'text', text: 'IMAGE_TEST' }, { type: 'image', attachment: image }],
+  source: { kind: 'user' },
+}))
+await agent.whenIdle()
+const imageSeen = JSON.parse(readFileSync(join(root, 'image-seen.json'), 'utf8'))
+check('prompt images reach pi', imageSeen.images === 1, JSON.stringify(imageSeen))
+
+const rebuilt = await buildPiSessionFile({
+  session: agent.session,
+  cwd: root,
+  filePath: join(root, 'rebuilt.jsonl'),
+  logger: () => {},
+  attachments: ctx.attachments,
+})
+const rebuiltEntries = readFileSync(rebuilt, 'utf8').trim().split(/\r?\n/).slice(1).map((line) => JSON.parse(line))
+const rebuiltImage = rebuiltEntries.find((entry) => entry.message?.role === 'user'
+  && Array.isArray(entry.message.content)
+  && entry.message.content.some((block) => block.type === 'image'))
+const rebuiltImageBlock = rebuiltImage?.message.content.find((block) => block.type === 'image')
+check(
+  'resume history keeps prompt images',
+  typeof rebuiltImageBlock?.data === 'string' && typeof rebuiltImageBlock?.mimeType === 'string',
+  JSON.stringify(rebuiltImageBlock ?? null),
+)
+
+// 8. A next-step message injected while a tool is running reaches pi as a steer.
+agent.followup(createUserMessage({
+  content: [{ type: 'text', text: 'Use the bash tool to run exactly: sleep 5. After it finishes, reply exactly: SLOW_DONE' }],
+  source: { kind: 'user' },
+}))
+const toolDeadline = Date.now() + 30000
+while (Date.now() < toolDeadline
+  && !agent.session.ownEvents().some((event) => event.type === 'tool/call' && event.data.name === 'bash')) {
+  await new Promise((resolveWait) => setTimeout(resolveWait, 100))
+}
+agent.inject(createUserMessage({ content: [{ type: 'text', text: 'INJECT_TEST' }], source: { kind: 'user' } }))
+await agent.whenIdle()
+const injected = existsSync(join(root, 'inject-seen.json'))
+  ? JSON.parse(readFileSync(join(root, 'inject-seen.json'), 'utf8'))
+  : null
+check(
+  'injected next-step reaches pi mid-run',
+  injected?.text === 'INJECT_TEST',
+  JSON.stringify(injected),
+)
+
+// 9. A selected model is applied before the next prompt reaches pi.
+agent.model.select({ provider: 'deepseek', model: 'deepseek-v4-pro', reasoningEffort: 'high' })
+await ask('Reply with exactly: MODEL_SELECT_OK')
+const selectedAssistant = agent.session.ownEvents().filter((event) => event.type === 'assistant/message').at(-1)
+const selectedModel = selectedAssistant?.data?.message?.source?.model
+check('model selection reaches pi before the next prompt', selectedModel === 'deepseek-v4-pro', String(selectedModel))
 
 await handle.dispose()
 await new Promise((resolve) => setTimeout(resolve, 300))

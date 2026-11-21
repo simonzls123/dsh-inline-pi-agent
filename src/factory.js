@@ -24,13 +24,6 @@ function routeOptions(route) {
   return { provider: route.slice(0, separator), model: route.slice(separator + 1) }
 }
 
-/** Split a pi route string into the `set_model` fields. */
-function splitRoute(route) {
-  const separator = route.indexOf('/')
-  if (separator === -1) return undefined
-  return { provider: route.slice(0, separator), modelId: route.slice(separator + 1) }
-}
-
 export class PiAgentFactory {
   constructor(registryCtx, options) {
     this.registryCtx = registryCtx
@@ -77,11 +70,12 @@ export class PiAgentFactory {
   async #initialize(ownerCtx, { session, stored, agentOptions, setup, signal, source, parentAgent }) {
     const cwd = session.header.cwd ?? this.options.cwd
     const history = session.snapshotEvents()
-    const sessionFile = history.length === 0 ? undefined : buildPiSessionFile({
+    const sessionFile = history.length === 0 ? undefined : await buildPiSessionFile({
       session,
       cwd,
       filePath: this.#sessionFile(session.id),
       logger: this.options.logger,
+      attachments: this.registryCtx.get('attachments'),
     })
 
     // Reserve the bridge token before spawning: the child needs it in its env,
@@ -130,24 +124,10 @@ export class PiAgentFactory {
     // Tool calls can only arrive after a prompt, so filling the box here is
     // always earlier than the bridge needs it.
     if (reservation !== undefined) reservation.box.agent = agent
-    // Align pi's route with the route this session already shows: prefer the
-    // configured mapping, else try the DSH route verbatim (identical names).
-    const requestedRoute = requested.provider === undefined || requested.model === undefined
-      ? undefined
-      : `${requested.provider}/${requested.model}`
-    const route = splitRoute(this.options.models?.[requestedRoute] ?? requestedRoute ?? '')
-    if (route !== undefined) {
-      const level = requested.reasoningEffort
-      // Serialized: thinking levels are validated against the selected model.
-      void (async () => {
-        try {
-          await rpc.setModel(route.provider, route.modelId)
-          if (typeof level === 'string' && level !== '') await rpc.setThinkingLevel(level)
-        } catch (error) {
-          this.options.logger?.(`[pi] initial route failed: ${String(error)}`)
-        }
-      })()
-    }
+    // Align pi's route before the first prompt. The session's persisted
+    // `model/selection` wins over the deployment default in `requested`.
+    const initialSelection = agent.model.current()
+    if (initialSelection !== undefined) await agent.syncModel(initialSelection)
 
     let detachSession
     let detachAgent
