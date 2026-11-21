@@ -24,11 +24,20 @@ function routeOptions(route) {
   return { provider: route.slice(0, separator), model: route.slice(separator + 1) }
 }
 
+/** Close a persisted session handle exactly once (initialize failure paths overlap). */
+async function closeStored(stored) {
+  if (stored === undefined || stored.closed === true) return
+  stored.closed = true
+  await stored.handle.close().catch(() => undefined)
+}
+
 export class PiAgentFactory {
   constructor(registryCtx, options) {
     this.registryCtx = registryCtx
     this.options = options
     this.live = new Set()
+    this.piSessionDirectory = options.piSessionDir ?? join(homedir(), '.dsh', 'pi-sessions')
+    mkdirSync(this.piSessionDirectory, { recursive: true })
   }
 
   /** Stop every agent this factory published (plugin unload). */
@@ -39,9 +48,8 @@ export class PiAgentFactory {
   }
 
   #sessionFile(id) {
-    const directory = this.options.piSessionDir ?? join(homedir(), '.dsh', 'pi-sessions')
-    mkdirSync(directory, { recursive: true })
-    return join(directory, `${String(id).replace(/[^\w-]/g, '_')}.jsonl`)
+    mkdirSync(this.piSessionDirectory, { recursive: true })
+    return join(this.piSessionDirectory, `${String(id).replace(/[^\w-]/g, '_')}.jsonl`)
   }
 
   /** Take write ownership when a persistence backend is mounted. */
@@ -140,7 +148,7 @@ export class PiAgentFactory {
           await agent.dispose()
         } finally {
           try {
-            await stored?.handle.close()
+            await closeStored(stored)
           } finally {
             if (reservation !== undefined) this.options.bridge.unbind(reservation.token)
             detachAgent?.()
@@ -197,7 +205,7 @@ export class PiAgentFactory {
         parentAgent: options.parentAgent,
       })
     } catch (error) {
-      await stored?.handle.close().catch(() => undefined)
+      await closeStored(stored)
       throw error
     }
   }
@@ -211,6 +219,7 @@ export class PiAgentFactory {
     const handle = await persistence.open(id, 'write', {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     })
+    const stored = { handle, storedCount: 0 }
     try {
       const coldRead = await handle.read(0, undefined, {
         ...(options.signal === undefined ? {} : { signal: options.signal }),
@@ -219,6 +228,7 @@ export class PiAgentFactory {
       // A log whose last turn never ended is closed before replay (crash repair).
       const closers = interruptedTurnClosers(persisted)
       if (closers.length > 0) await handle.append(closers)
+      stored.storedCount = persisted.length + closers.length
 
       const session = this.registryCtx.sessions.prepare(id, {
         seed: [...persisted, ...closers],
@@ -228,7 +238,7 @@ export class PiAgentFactory {
       })
       return await this.#initialize(ownerCtx, {
         session,
-        stored: { handle, storedCount: persisted.length + closers.length },
+        stored,
         agentOptions: options.agentOptions ?? {},
         setup: options.setup,
         signal: options.signal,
@@ -236,7 +246,7 @@ export class PiAgentFactory {
         parentAgent: options.parentAgent,
       })
     } catch (error) {
-      await handle.close().catch(() => undefined)
+      await closeStored(stored)
       throw error
     }
   }

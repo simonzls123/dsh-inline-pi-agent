@@ -94,6 +94,7 @@ Two boundaries:
 - A prompt that pi reports as `disposition: "handled"` (extension command or input handler) starts no run. The plugin closes the turn as completed instead of waiting for `agent_settled`.
 - A session's persisted `model/selection` wins over the deployment default on resume, and every prompt waits for `set_model` + `set_thinking_level` to settle.
 - `next-step`/injected messages arriving during a run are delivered through pi's `steer`; messages that miss the turn stay queued and start the next turn.
+- Tool result text is capped at 64KB; image/binary results are recorded as placeholders, never as base64 in the DSH session log. An `extension_error` thrown by a pi extension is written to the DSH warn log.
 
 ## Known limitations
 

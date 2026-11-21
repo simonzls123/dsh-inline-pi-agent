@@ -60,17 +60,43 @@ function convertUsage(usage) {
   }
 }
 
+/** Cap model-visible tool text so a binary/image result cannot bloat the DSH log. */
+const TOOL_RESULT_TEXT_LIMIT = 64 * 1024
+
+function capToolResultText(text) {
+  return text.length <= TOOL_RESULT_TEXT_LIMIT
+    ? text
+    : `${text.slice(0, TOOL_RESULT_TEXT_LIMIT)}\n…[truncated ${String(text.length - TOOL_RESULT_TEXT_LIMIT)} chars]`
+}
+
 /** Flatten pi tool output into DSH tool-result text. */
 function resultText(result) {
-  if (typeof result === 'string') return result
+  if (typeof result === 'string') return capToolResultText(result)
+  if (ArrayBuffer.isView(result)) return `[binary result omitted: ${String(result.byteLength)} bytes]`
   if (result && Array.isArray(result.content)) {
-    const text = result.content
-      .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
-      .map((block) => block.text)
-      .join('\n')
-    if (text !== '') return text
+    const parts = []
+    let omitted = 0
+    for (const block of result.content) {
+      if (!block || typeof block !== 'object') continue
+      if (block.type === 'text' && typeof block.text === 'string') {
+        parts.push(block.text)
+      } else if (block.type === 'image') {
+        parts.push(`[image result omitted: ${String(block.mimeType ?? 'image')}, ${String(block.data?.length ?? '?')} base64 chars]`)
+      } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+        parts.push(block.thinking)
+      } else {
+        omitted += 1
+      }
+    }
+    if (omitted > 0) parts.push(`[${String(omitted)} non-text result block(s) omitted]`)
+    if (parts.length > 0) return capToolResultText(parts.join('\n'))
   }
-  return result === undefined ? '' : JSON.stringify(result)
+  if (result === undefined) return ''
+  try {
+    return capToolResultText(JSON.stringify(result))
+  } catch {
+    return '[unserializable tool result]'
+  }
 }
 
 /**
@@ -561,6 +587,18 @@ export class PiAgent {
         for (const resolve of waiters) resolve()
         return
       }
+      case 'extension_error': {
+        const message = `[pi] extension error (${String(event.event ?? 'unknown')}) ${String(event.extensionPath ?? '')}: ${String(event.error ?? '')}`
+        this.logger?.(message)
+        this.ctx.logger?.warn?.(message)
+        return
+      }
+      case 'session_info_changed':
+        this.logger?.(`[pi] session name ${JSON.stringify(event.name ?? null)}`)
+        return
+      case 'queue_update':
+        this.logger?.(`[pi] queue steering=${String(event.steering?.length ?? 0)} followUp=${String(event.followUp?.length ?? 0)}`)
+        return
       default:
         return
     }

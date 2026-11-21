@@ -118,6 +118,7 @@ pi 执行自己的工具，DSH 的审批策略原本看不到它们。开启下�
 - pi 对扩展命令/输入处理器返回 `disposition: "handled"` 时不启动 run；插件直接把该 turn 记为完成，不再等待 `agent_settled`。
 - resume 时会话持久化的 `model/selection` 优先于部署默认模型；每次 prompt 前会等待 `set_model` + `set_thinking_level` 完成。
 - 运行中到达的 `next-step`/inject 消息通过 pi 的 `steer` 下发；错过当前 turn 的消息留在队列，下一轮再发。
+- 工具结果文本上限 64KB；图片/二进制结果只记录占位说明，不把 base64 写进 DSH 会话日志。pi 扩展抛出的 `extension_error` 会写入 DSH warn 日志。
 
 ## 已知限制
 

@@ -9,7 +9,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 import { shadowedSeqSet } from './compaction.js'
@@ -206,7 +206,21 @@ export async function buildPiSessionFile({ session, cwd, filePath, logger, attac
   }
   const lines = [JSON.stringify(header), ...entries.map((entry) => JSON.stringify(entry))]
   mkdirSync(dirname(filePath), { recursive: true })
-  writeFileSync(filePath, `${lines.join('\n')}\n`)
+  const payload = `${lines.join('\n')}\n`
+  const temporary = `${filePath}.tmp-${randomUUID()}`
+  try {
+    writeFileSync(temporary, payload)
+    try {
+      renameSync(temporary, filePath)
+    } catch {
+      // Windows may refuse to replace an existing target; retry after removing it.
+      rmSync(filePath, { force: true })
+      renameSync(temporary, filePath)
+    }
+  } catch (error) {
+    rmSync(temporary, { force: true })
+    throw error
+  }
   logger?.(`[history] wrote ${String(entries.length)} entries to ${filePath}`)
   return filePath
 }
